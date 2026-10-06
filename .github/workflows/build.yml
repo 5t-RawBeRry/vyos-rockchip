@@ -88,8 +88,8 @@ jobs:
           sudo python3 tests/boot-media.py
           python3 tests/net-tune.py
           python3 tests/aic8800.py
-          for script in lib/*.sh scripts/*.sh tests/*.sh .github/scripts/build; do bash -n "$script"; done
-          shellcheck -S warning -x lib/{sources,kernel,iso,uboot,builder,r8125,aic8800,deps,overlay,image,imgiso}.sh scripts/docker-build.sh tests/*.sh .github/scripts/build
+          for script in lib/*.sh scripts/*.sh tests/*.sh .github/scripts/build .github/scripts/vyos-rolling; do bash -n "$script"; done
+          shellcheck -S warning -x lib/{sources,kernel,iso,uboot,builder,r8125,aic8800,deps,overlay,image,imgiso}.sh scripts/docker-build.sh tests/*.sh .github/scripts/build .github/scripts/vyos-rolling
 
   base:
     runs-on: ubuntu-24.04-arm

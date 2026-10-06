@@ -468,6 +468,15 @@ board=a5e|e20c|m28k|r5s|e52c|all、kernel_mode、iso_cache）。
   reuse=同输入即复用，off=总重建——rolling 软件源每天变，默认 daily 折中）；每板 src（干净克隆）
   与 U-Boot（产物旁另存 `u-boot.config`/`u-boot.dtb` 供 A5E DT 契约检查，跳过重编时也有输入）。
 - **`BUILDER_PULL=0`**：官方 `vyos/vyos-build:current` 只有 amd64，arm64 上 pull 白拉一趟。
+- **自动跟进 VyOS rolling（`.github/workflows/vyos-rolling.yml`，每 6 小时）**：rolling 软件源只留
+  最新的按内核编译的模块包（nat-rtsp/jool… 依赖同版本 linux-image），上游一换内核，旧
+  `VYOS_BUILD_REF` 就会让 chroot 装进两个内核、`17-gen_initramfs` 失败（2026-10-06 6.18.50→.54 真踩）。
+  `.github/scripts/vyos-rolling detect` 比较 vyos-build rolling HEAD 的 kernel_version 与软件源
+  arm64 的 linux-image：一致且 HEAD≠钉的版本 → `apply` 改 build.conf 的 `# pinned:` 与
+  `VYOS_BUILD_REF` 两行（格式勿改）→ 推 `bump/vyos-rolling` → 跑 build-image 验证 → 通过即快进合入
+  main 并再跑一次 main（暖缓存、出产物），失败开/追加 issue“VyOS rolling 跟进失败”，main 不动；
+  不一致 = 上游换内核过渡期，本轮不动。官方 nightly 镜像发版滞后于软件源（10-06 时 nightly 仍是
+  09-30/6.18.50），所以跟的是软件源而非 nightly。自动跟进只保证可构建，实机验证另走发版流程。
 - 产物 artifact `vyos-<板>`（img.xz + ISO + sha256）。手动跑：
   `gh workflow run build-image -R <owner>/vyos-sbc -f board=a5e`。
 

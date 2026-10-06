@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# 跟踪 VyOS rolling（.github/workflows/vyos-rolling.yml 调用）。
+#   detect                    对比上游与 build.conf 的钉版本，判定写进 $GITHUB_OUTPUT（无则 stdout）
+#   apply <sha> <date> <kv>   改写 build.conf 的 "# pinned:" 与 VYOS_BUILD_REF 两行
+#
+# 判定（decision）：
+#   current     钉的就是 vyos-build rolling HEAD
+#   bump        HEAD 有新提交，且其 kernel_version 与 rolling 软件源的 linux-image 一致
+#   transition  两者内核不一致：上游正在换内核（vyos-build 已升、软件源未重建），下轮再看
+# urgent=true 表示软件源内核已与钉的版本不同：当前钉的版本已无法构建（两个内核进 chroot）。
+set -Eeuo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+
+PACKAGES_URL="https://packages.vyos.net/repositories/rolling/dists/rolling/main/binary-arm64/Packages.gz"
+PIN_LINE='^# pinned: vyos-build rolling [0-9]{4}-[0-9]{2}-[0-9]{2}, kernel_version=[0-9.]+$'
+REF_LINE='^VYOS_BUILD_REF="\$\{VYOS_BUILD_REF:-[0-9a-f]{40}\}"$'
+
+detect() {
+  local head date kv_build kv_repo cur cur_kv decision urgent=false
+  head="$(gh api repos/vyos/vyos-build/commits/rolling --jq .sha)"
+  date="$(gh api "repos/vyos/vyos-build/commits/${head}" --jq '.commit.committer.date[0:10]')"
+  kv_build="$(gh api "repos/vyos/vyos-build/contents/data/defaults.toml?ref=${head}" --jq .content \
+    | base64 -d | awk -F'"' '/^kernel_version/ {print $2; exit}')"
+  kv_repo="$(curl -fsSL --retry 3 "${PACKAGES_URL}" | gzip -dc \
+    | sed -n 's/^Package: linux-image-\(.*\)-vyos$/\1/p' | sort -V | tail -1)"
+  cur="$(tr -d '\r' < build.conf | sed -nE 's/^VYOS_BUILD_REF="\$\{VYOS_BUILD_REF:-([0-9a-f]{40})\}"$/\1/p')"
+  cur_kv="$(tr -d '\r' < build.conf | sed -nE 's/^# pinned: .*kernel_version=([0-9.]+)$/\1/p')"
+  for v in head date kv_build kv_repo cur cur_kv; do
+    [[ -n "${!v}" ]] || { echo "无法确定 ${v}" >&2; return 1; }
+  done
+
+  if [[ "${kv_build}" != "${kv_repo}" ]]; then
+    decision=transition
+  elif [[ "${head}" == "${cur}" ]]; then
+    decision=current
+  else
+    decision=bump
+  fi
+  [[ "${cur_kv}" == "${kv_repo}" ]] || urgent=true
+
+  {
+    echo "decision=${decision}"
+    echo "urgent=${urgent}"
+    echo "head=${head}"
+    echo "date=${date}"
+    echo "kv_build=${kv_build}"
+    echo "kv_repo=${kv_repo}"
+    echo "cur=${cur}"
+    echo "cur_kv=${cur_kv}"
+  } >> "${GITHUB_OUTPUT:-/dev/stdout}"
+}
+
+apply() {
+  local sha="$1" date="$2" kv="$3" line pins=0 refs=0
+  [[ "${sha}" =~ ^[0-9a-f]{40}$ && "${date}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && "${kv}" =~ ^[0-9]+(\.[0-9]+)+$ ]] \
+    || { echo "非法参数：${sha} ${date} ${kv}" >&2; return 1; }
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" =~ ${PIN_LINE} ]]; then
+      line="# pinned: vyos-build rolling ${date}, kernel_version=${kv}"; pins=$((pins + 1))
+    elif [[ "${line}" =~ ${REF_LINE} ]]; then
+      line="VYOS_BUILD_REF=\"\${VYOS_BUILD_REF:-${sha}}\""; refs=$((refs + 1))
+    fi
+    printf '%s\n' "${line}"
+  done < build.conf > build.conf.tmp
+  if [[ "${pins}" != 1 || "${refs}" != 1 ]]; then
+    rm -f build.conf.tmp
+    echo "build.conf 钉版本行格式不符（pinned=${pins} ref=${refs}）" >&2
+    return 1
+  fi
+  mv build.conf.tmp build.conf
+}
+
+case "${1:-}" in
+  detect) detect ;;
+  apply)  shift; apply "$@" ;;
+  *)      echo "用法：$0 detect | apply <sha> <date> <kernel_version>" >&2; exit 2 ;;
+esac

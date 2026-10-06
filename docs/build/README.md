@@ -78,3 +78,9 @@ CI 与本地走同一条路径：经 `scripts/docker-build.sh` 在 `docker/Docke
 | src / uboot | 每板干净源码克隆、U-Boot 产物 | 源码 ref 或 U-Boot 输入变化 |
 
 产物为每板一个 artifact（`.img.xz`、`.iso` 与校验文件），Summary 页列出各缓存是否命中。CI 构建和离线回归通过不等于真机验收通过。
+
+### 自动跟进 VyOS rolling
+
+VyOS rolling 软件源只保留最新的、按内核版本编译的模块包，上游换内核后旧的 `VYOS_BUILD_REF` 会构建失败。[`vyos-rolling`](../../.github/workflows/vyos-rolling.yml) 每 6 小时检查一次（也可手动触发）：vyos-build rolling 有新提交、且其内核版本与软件源一致时，自动改 `build.conf` 的钉版本，在 `bump/vyos-rolling` 分支跑 `build-image` 验证；通过则合入 `main` 并在 `main` 上再构建一次，失败则开 issue “VyOS rolling 跟进失败”，`main` 保持不变。两者内核不一致说明上游正在换内核，等下一轮。
+
+`build.conf` 中 `# pinned:` 与 `VYOS_BUILD_REF` 两行由该流程改写，手工修改时须保持格式。自动跟进只保证可构建，实机验证仍按发版流程进行。
