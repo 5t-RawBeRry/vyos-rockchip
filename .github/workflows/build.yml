@@ -1,95 +1,83 @@
 name: build-image
 
-# 原生 arm64 runner（ubuntu-24.04-arm）构建 vyos-sbc 整盘镜像。
-# 关键：arm64 runner 上 `docker run --platform linux/arm64` 与 chroot 均为原生执行，
-# 不挂 qemu 仿真 —— 这正是相对本地 x86 的提速来源（lb build 不再被仿真拖慢）。
+# 原生 arm64 runner（ubuntu-24.04-arm）构建 vyos-sbc 镜像，全程无 qemu。仅手动触发。
+# 构建与本地完全同一条路径：.github/scripts/build → scripts/docker-build.sh → 在
+# docker/Dockerfile.host 宿主容器里跑 scripts/build.sh（与 andy/v2in0 同一套工具链：
+# Debian trixie gcc / pahole），CI 产物与本地验证过的构建环境一致。
 #
-# 两道 actions/cache：
-#   ① work/src       —— u-boot / rkbin / rtl8125 / aic8800 的克隆（rkbin 体积大，省下载）
-#   ② work/kernel(+) —— 交叉编出的内核树 + deb + 输入指纹。内核片段/补丁未变时，
-#                       kernel 阶段据指纹跳过重编（约省 10–15min），且这棵已编树给
-#                       r8125/aic8800 的 out-of-tree 模块编译用（它们需 Module.symvers）。
-# base ISO 不缓存：每次全新 lb build（VyOS rolling 包集会变，求新鲜与可复现）。
+#   checks  离线回归 + ShellCheck，与 base 并行；失败则不出镜像。
+#   base    板无关产物：宿主容器 → builder 容器 → 内核 deb（+外置模块构建集）→ base ISO。
+#   board   每板一个（matrix）：U-Boot → 外置驱动 → 整盘 .img.xz + 每板 .iso。
+#
+# 缓存 key 取 `build --digest <域>`，即各阶段判定“可跳过”所用的同一个指纹（含宿主容器
+# 层摘要）：key 命中 ⇔ 阶段跳过，不存在“命中却重建”或“该命中没命中”。
+#   host     宿主容器镜像（docker save；按 docker/ 上下文复用，层摘要因而稳定）
+#   builder  vyos-build arm64 构建容器（docker save；vyos-build docker/ 上下文指纹）
+#   kernel   linux-image deb + 输入指纹 + 裁剪后的内核树（外置模块编译与签名用，~150MiB）
+#   ccache   内核未命中时增量重编（同路径解包；改 DTS/补丁只重编受影响的文件）
+#   iso      base ISO；新鲜度由 iso_cache 输入决定（VyOS rolling 软件源每天在变）
+#   src      每板 U-Boot / 固件 / 驱动源码的干净克隆
+#   uboot    每板 U-Boot 产物（按前缀恢复最新一份，引擎 stamp 校验，按指纹另存）
+# 内核与 ISO 以“指纹-run_id”唯一 key 保存、按前缀恢复；board job 按 base 实际使用的 key
+# 精确恢复 → ISO 里的内核与外置模块的签名密钥必出自同一次内核构建（MODULE_SIG_FORCE）。
 
 on:
-  workflow_dispatch:        # 只手动触发（避免每次 push 自动跑、吃 runner 时间）
+  workflow_dispatch:
     inputs:
       board:
-        description: "设备"
+        description: "设备（all = 五板并行）"
         type: choice
-        options: [r5s, m28k, e20c, e52c, a5e]
+        options: [a5e, e20c, m28k, r5s, e52c, all]
         default: a5e
       kernel_mode:
-        description: "内核构建方式（cross=宿主交叉;container=官方容器。A5E/m28k/r5s/e52c 的外置驱动需要 cross；e20c 两者皆可）"
+        description: "内核构建方式（带外置驱动的板必须 cross；container 只适合 e20c）"
         type: choice
         options: [cross, container]
         default: cross
+      iso_cache:
+        description: "base ISO 复用：daily=当天同输入复用；reuse=同输入即复用；off=总是重新 lb build"
+        type: choice
+        options: [daily, reuse, "off"]
+        default: daily
 
 concurrency:
-  group: build-${{ github.ref }}-${{ github.event.inputs.board || 'a5e' }}
+  group: build-${{ github.ref }}-${{ inputs.board }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
 env:
-  BOARD: ${{ github.event.inputs.board || 'a5e' }}
-  # cross（默认）：宿主交叉编译,leaner、快,且产出宿主侧内核树供 r8125/aic8800 编 out-of-tree 模块。
-  # container（正常）：官方 build.py 在 arm64 容器里跑（原生无 qemu,但更重）;无宿主侧内核树,
-  #                    故只适合无 out-of-tree 驱动的板（e20c）。
-  KERNEL_BUILD_MODE: ${{ github.event.inputs.kernel_mode || 'cross' }}
-  # 官方 vyos/vyos-build:current 是单架构(amd64)、没有 arm64 变体 → 在 arm64 runner 上
-  # 拉它只会得到 amd64（脚本会判出不对再回退本地构建，白拉一趟）。故直接 0：跳过 pull，
-  # 用 work/vyos-build/docker 的 Dockerfile 在 arm64 上原生构建 builder 容器。
+  KERNEL_BUILD_MODE: ${{ inputs.kernel_mode }}
+  KERNEL_TREE_PRUNE: "1"
+  KERNEL_CCACHE: "1"
+  CCACHE_DIR: ${{ github.workspace }}/work/ccache
+  CCACHE_MAXSIZE: 3G
+  CCACHE_COMPILERCHECK: content
+  HOST_IMAGE: vyos-sbc/host:local
+  # 官方 vyos/vyos-build:current 只有 amd64；arm64 上直接用 vyos-build docker/ 本地构建。
+  BUILDER_IMAGE: vyos-sbc/builder:rolling
   BUILDER_PULL: "0"
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04-arm   # ← 原生 arm64，无 qemu
-    timeout-minutes: 120
-
+  checks:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      # container（正常）模式没有宿主侧内核树,带 out-of-tree 驱动的板会在 aic8800/r8125
-      # 阶段失败 → 早退并给清楚提示,省得白跑。
-      - name: Validate kernel mode vs board
+      - name: Install test deps
         run: |
-          source "boards/$BOARD/board.conf"
-          if [[ "$KERNEL_BUILD_MODE" == container &&
-                ( "${BOARD_WIFI_AIC8800:-0}" == 1 || "${BOARD_R8125:-0}" == 1 ) ]]; then
-            echo "::error::$BOARD 的外置驱动需要宿主侧内核树和签名密钥，请使用 cross。"
-            exit 1
-          fi
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            git rsync zstd xz-utils tar file parted dosfstools e2fsprogs squashfs-tools kmod util-linux \
+            python3 python3-pyelftools python3-pycryptodome xorriso dpkg-dev fakeroot shellcheck
 
-      # GHA runner 根盘默认空闲偏小（~14GB），本构建峰值约需 25–40GB。
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main   # 可按需 pin 到具体 commit
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: false   # 我们要 docker，别清运行时
-          swap-storage: false
-
-      - name: Install host build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            git curl rsync zstd xz-utils tar ca-certificates \
-            parted dosfstools e2fsprogs squashfs-tools kmod util-linux \
-            build-essential bc bison flex libssl-dev libelf-dev swig \
-            gcc-aarch64-linux-gnu libc6-dev-arm64-cross libgnutls28-dev \
-            python3 python3-dev python3-setuptools python3-pycryptodome python3-pyelftools xorriso \
-            debhelper dpkg-dev fakeroot shellcheck
-          # 交叉工具链兜底：若该平台未提供 aarch64-linux-gnu-* 前缀，软链到原生工具
-          if ! command -v aarch64-linux-gnu-gcc >/dev/null; then
-            for t in gcc ld objcopy objdump nm ar strip; do
-              src=$(command -v "$t") && sudo ln -sf "$src" "/usr/local/bin/aarch64-linux-gnu-$t"
-            done
-          fi
-
-      - name: Build regression tests
+      - name: Regression tests
         run: |
           for test in tests/*.sh; do bash "$test"; done
           python3 tests/a5e-hwid.py
@@ -97,105 +85,443 @@ jobs:
           sudo python3 tests/boot-media.py
           python3 tests/net-tune.py
           python3 tests/aic8800.py
-          for script in lib/*.sh scripts/*.sh tests/*.sh; do bash -n "$script"; done
-          shellcheck -S warning -x lib/{sources,kernel,iso,uboot,builder,r8125,aic8800,deps,overlay,image,imgiso}.sh scripts/docker-build.sh tests/*.sh
+          for script in lib/*.sh scripts/*.sh tests/*.sh .github/scripts/build; do bash -n "$script"; done
+          shellcheck -S warning -x lib/{sources,kernel,iso,uboot,builder,r8125,aic8800,deps,overlay,image,imgiso}.sh scripts/docker-build.sh tests/*.sh .github/scripts/build
 
-      # ── 缓存①：源码克隆（按 build.conf 的 ref；rkbin 大，主要省下载/clone）─────
-      - name: Cache sources (work/src)
-        uses: actions/cache@v4
+  base:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    outputs:
+      boards: ${{ steps.plan.outputs.boards }}
+      kv: ${{ steps.kernel-key.outputs.kv }}
+      kernel-key: ${{ steps.kernel-done.outputs.key }}
+      iso-key: ${{ steps.iso-done.outputs.key }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # 带外置驱动的板在 container 模式下没有宿主侧内核树与签名密钥 → 早退，省得白跑。
+      - name: Plan boards
+        id: plan
+        env:
+          INPUT_BOARD: ${{ inputs.board }}
+        run: |
+          if [[ "$INPUT_BOARD" == all ]]; then boards=(e20c m28k r5s e52c a5e); else boards=("$INPUT_BOARD"); fi
+          for board in "${boards[@]}"; do
+            (
+              # shellcheck source=/dev/null
+              source "boards/$board/board.conf"
+              if [[ "$KERNEL_BUILD_MODE" == container &&
+                    ( "${BOARD_WIFI_AIC8800:-0}" == 1 || "${BOARD_R8125:-0}" == 1 ) ]]; then
+                echo "::error::$board 的外置驱动需要宿主侧内核树和签名密钥，请使用 cross。"
+                exit 1
+              fi
+            )
+          done
+          echo "boards=$(printf '%s\n' "${boards[@]}" | jq -Rnc '[inputs]')" >> "$GITHUB_OUTPUT"
+
+      # 内核树（裁剪前 ~14GiB）+ lb build + 两个容器镜像，峰值约 30GiB。
+      - name: Free disk space + runner resources
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/share/boost /usr/share/swift /opt/hostedtoolcache || true
+          df -h / | tail -1
+          {
+            echo "JOBS=$(nproc)"
+            echo "BUILD_CPUS=$(nproc)"
+            echo "BUILD_MEMORY=$(( $(awk '/MemTotal/ {print int($2/1048576)}' /proc/meminfo) - 1 ))g"
+          } >> "$GITHUB_ENV"
+
+      # ── 宿主容器 ────────────────────────────────────────────────────────────
+      - name: Restore host image
+        id: host-cache
+        uses: actions/cache/restore@v6
         with:
-          path: work/src
-          key: src-${{ runner.arch }}-${{ hashFiles('build.conf', 'lib/sources.sh', 'lib/r8125.sh', 'lib/aic8800.sh') }}
-          restore-keys: |
-            src-${{ runner.arch }}-
+          path: ~/.cache/vyos-host.tar.zst
+          key: host-${{ runner.arch }}-${{ hashFiles('docker/**', 'scripts/docker-build.sh') }}
 
-      # ── 缓存②：内核树 + deb + 输入指纹（片段/补丁未变即命中→跳过重编）──────────
-      # work/kernel 含交叉编树（Module.symvers/signing_key，供 r8125）与产出的 deb；
-      # kernel-inputs.sha256 是 build.sh 的内核输入指纹，命中后 kernel 阶段据此跳过。
-      - name: Cache kernel tree + deb
-        uses: actions/cache@v4
+      - name: Load host image
+        if: steps.host-cache.outputs.cache-hit == 'true'
+        run: zstd -dc ~/.cache/vyos-host.tar.zst | docker load && rm -f ~/.cache/vyos-host.tar.zst
+
+      - name: Sources + overlay
+        run: .github/scripts/build --stages sources,overlay
+
+      - name: Export host image
+        if: steps.host-cache.outputs.cache-hit != 'true'
+        run: mkdir -p ~/.cache && docker save "$HOST_IMAGE" | zstd -T0 -3 -q -o ~/.cache/vyos-host.tar.zst
+
+      - name: Save host image
+        if: steps.host-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/vyos-host.tar.zst
+          key: ${{ steps.host-cache.outputs.cache-primary-key }}
+
+      # ── builder 容器 ────────────────────────────────────────────────────────
+      - name: Builder cache key
+        id: builder-key
+        run: |
+          rm -f ~/.cache/vyos-host.tar.zst
+          digest=$(.github/scripts/build --digest builder)
+          echo "key=builder-${RUNNER_ARCH}-${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore builder image
+        id: builder-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/vyos-builder.tar.zst
+          key: ${{ steps.builder-key.outputs.key }}
+
+      - name: Load builder image
+        if: steps.builder-cache.outputs.cache-hit == 'true'
+        run: zstd -dc ~/.cache/vyos-builder.tar.zst | docker load && rm -f ~/.cache/vyos-builder.tar.zst
+
+      - name: Builder
+        run: .github/scripts/build --stages builder
+
+      - name: Export builder image
+        if: steps.builder-cache.outputs.cache-hit != 'true'
+        run: mkdir -p ~/.cache && docker save "$BUILDER_IMAGE" | zstd -T0 -3 -q -o ~/.cache/vyos-builder.tar.zst
+
+      - name: Save builder image
+        if: steps.builder-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/vyos-builder.tar.zst
+          key: ${{ steps.builder-key.outputs.key }}
+
+      # ── 内核 ────────────────────────────────────────────────────────────────
+      - name: Kernel cache key
+        id: kernel-key
+        run: |
+          rm -f ~/.cache/vyos-builder.tar.zst
+          digest=$(.github/scripts/build --digest kernel)
+          kv=$(awk -F'"' '/^kernel_version/ {print $2; exit}' work/vyos-build/data/defaults.toml)
+          [[ -n "$kv" ]]
+          echo "prefix=kernel-${RUNNER_ARCH}-${KERNEL_BUILD_MODE}-${digest}-" >> "$GITHUB_OUTPUT"
+          echo "kv=${kv}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore kernel
+        id: kernel-cache
+        uses: actions/cache/restore@v6
         with:
           path: |
-            work/kernel
+            work/vyos-build/packages/linux-image-*-vyos_*_arm64.deb
             work/state/kernel-inputs.sha256
-          key: kernel-${{ runner.arch }}-${{ hashFiles('build.conf', 'lib/kernel.sh', 'lib/builder.sh', 'overlay/scripts/package-build/linux-kernel/config/**', 'overlay/scripts/package-build/linux-kernel/patches/kernel/**', 'boards/*/overlay/scripts/package-build/linux-kernel/patches/kernel/**') }}
+            work/kernel/linux-${{ steps.kernel-key.outputs.kv }}
+          key: ${{ steps.kernel-key.outputs.prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.kernel-key.outputs.prefix }}
 
-      # 阶段拆两段，中间把缓存里的内核 deb 摆回 packages/ 让 kernel 阶段能据指纹跳过。
-      # （work/vyos-build 由 sources 阶段 git clone，故 deb 不能预先放进它的 packages/，
-      #   否则 clone 会因目录非空失败 —— 所以等 clone 完再拷。跳过 deps：其 qemu-binfmt
-      #   检查在原生 arm64 会误报 fatal。）
-      # ── 缓存③：本地构建的 arm64 builder 容器镜像 ───────────────────────────────
-      # 官方 vyos/vyos-build:current 单架构(amd64)，arm64 上 BUILDER_PULL=0 走本地构建，
-      # 每次约几分钟。docker save|zstd 进 cache，命中即 load，stage_builder 见镜像在就跳过。
-      - name: Cache vyos-build arm64 container image
-        id: builder-cache
-        uses: actions/cache@v4
+      - name: Restore ccache
+        if: steps.kernel-cache.outputs.cache-matched-key == '' && env.KERNEL_BUILD_MODE == 'cross'
+        uses: actions/cache/restore@v6
         with:
-          path: ~/.cache/vyos-builder
-          key: builder-${{ runner.arch }}-${{ hashFiles('build.conf', 'lib/builder.sh') }}
+          path: work/ccache
+          key: ccache-${{ runner.arch }}-${{ steps.kernel-key.outputs.kv }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.arch }}-${{ steps.kernel-key.outputs.kv }}-
+            ccache-${{ runner.arch }}-
 
-      - name: Load cached builder image
-        if: steps.builder-cache.outputs.cache-hit == 'true'
-        run: zstd -dc ~/.cache/vyos-builder/img.tar.zst | docker load
-
-      - name: Sources + overlay + builder
-        run: scripts/build.sh "$BOARD" --stages sources,overlay,builder
-
-      - name: Save builder image to cache (on miss)
-        if: steps.builder-cache.outputs.cache-hit != 'true'
+      # 命中时引擎按指纹秒级跳过；未命中则交叉编（ccache）。built 以 deb 是否变化为准。
+      - name: Kernel
+        id: kernel
         run: |
-          mkdir -p ~/.cache/vyos-builder
-          docker save vyos-sbc/builder:rolling | zstd -T0 -19 > ~/.cache/vyos-builder/img.tar.zst
+          ccache_stats() { docker run --rm -e CCACHE_DIR -v "$CCACHE_DIR:$CCACHE_DIR" "$HOST_IMAGE" ccache "$@"; }
+          before=$(sha256sum work/vyos-build/packages/linux-image-*.deb 2>/dev/null || true)
+          mkdir -p "$CCACHE_DIR"
+          [[ "$KERNEL_BUILD_MODE" != cross ]] || ccache_stats -z >/dev/null
+          .github/scripts/build --stages kernel
+          [[ "$KERNEL_BUILD_MODE" != cross ]] || ccache_stats -s
+          after=$(sha256sum work/vyos-build/packages/linux-image-*.deb)
+          [[ "$before" == "$after" ]] && built=false || built=true
+          echo "built=${built}" >> "$GITHUB_OUTPUT"
 
-      - name: Restore cached kernel deb into packages/
+      - name: Trim kernel workspace
+        if: steps.kernel.outputs.built == 'true'
         run: |
-          shopt -s nullglob
-          debs=(work/kernel/linux-image-*-vyos_*_arm64.deb)
-          if (( ${#debs[@]} )); then
-            mkdir -p work/vyos-build/packages
-            cp -v "${debs[@]}" work/vyos-build/packages/
-            echo "命中内核缓存 → deb 已就位，kernel 阶段将跳过重编"
-          else
-            echo "无内核缓存，kernel 阶段将交叉编译"
+          rm -f work/kernel/*.deb work/kernel/*.buildinfo work/kernel/*.changes work/kernel/*.tar.* work/kernel/*.sign
+          du -sh work/kernel/* work/ccache || true
+          df -h / | tail -1
+
+      - name: Save kernel
+        if: steps.kernel.outputs.built == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            work/vyos-build/packages/linux-image-*-vyos_*_arm64.deb
+            work/state/kernel-inputs.sha256
+            work/kernel/linux-${{ steps.kernel-key.outputs.kv }}
+          key: ${{ steps.kernel-key.outputs.prefix }}${{ github.run_id }}
+
+      - name: Save ccache
+        if: steps.kernel.outputs.built == 'true' && env.KERNEL_BUILD_MODE == 'cross'
+        uses: actions/cache/save@v6
+        with:
+          path: work/ccache
+          key: ccache-${{ runner.arch }}-${{ steps.kernel-key.outputs.kv }}-${{ github.run_id }}
+
+      - name: Kernel key in use
+        id: kernel-done
+        env:
+          BUILT: ${{ steps.kernel.outputs.built }}
+          MATCHED: ${{ steps.kernel-cache.outputs.cache-matched-key }}
+          FRESH: ${{ steps.kernel-key.outputs.prefix }}${{ github.run_id }}
+        run: |
+          [[ "$BUILT" == true ]] && key="$FRESH" || key="$MATCHED"
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+
+      # ── base ISO ────────────────────────────────────────────────────────────
+      - name: ISO cache key
+        id: iso-key
+        run: |
+          digest=$(.github/scripts/build --digest iso)
+          base="iso-${RUNNER_ARCH}-${digest}-"
+          today="${base}$(date -u +%Y%m%d)-"
+          {
+            echo "save=${today}${GITHUB_RUN_ID}"
+            echo "today=${today}"
+            echo "any=${base}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore base ISO
+        id: iso-cache
+        if: inputs.iso_cache != 'off'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            work/iso/*.iso
+            work/state/iso-overlay.sha256
+            work/state/iso-path
+          key: ${{ steps.iso-key.outputs.save }}
+          restore-keys: |
+            ${{ steps.iso-key.outputs.today }}
+            ${{ inputs.iso_cache == 'reuse' && steps.iso-key.outputs.any || '' }}
+
+      # iso-path 记的是绝对路径（仓库改名后会失效）；touch 使其不早于内核 deb（引擎的 mtime 判据）。
+      - name: Re-anchor restored ISO
+        if: steps.iso-cache.outputs.cache-matched-key != ''
+        run: |
+          isos=(work/iso/*.iso)
+          [[ ${#isos[@]} -eq 1 && -f "${isos[0]}" ]]
+          iso="${isos[0]}"
+          echo "$PWD/$iso" > work/state/iso-path
+          touch "$iso"
+
+      - name: Base ISO
+        id: iso
+        run: |
+          before=$(cat work/state/iso-path 2>/dev/null || true)
+          .github/scripts/build --stages iso
+          after=$(cat work/state/iso-path)
+          [[ "$before" == "$after" ]] && built=false || built=true
+          echo "built=${built}" >> "$GITHUB_OUTPUT"
+          if [[ "$built" == true ]]; then
+            find work/iso -name '*.iso' ! -name "$(basename "$after")" -delete
           fi
 
-      - name: Kernel + ISO + board assets + U-Boot + image
-        run: scripts/build.sh "$BOARD" --stages kernel,iso,aic8800,r8125,oled,sources,uboot,image,imgiso
+      - name: Save base ISO
+        if: steps.iso.outputs.built == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            work/iso/*.iso
+            work/state/iso-overlay.sha256
+            work/state/iso-path
+          key: ${{ steps.iso-key.outputs.save }}
 
+      - name: ISO key in use
+        id: iso-done
+        env:
+          BUILT: ${{ steps.iso.outputs.built }}
+          MATCHED: ${{ steps.iso-cache.outputs.cache-matched-key }}
+          FRESH: ${{ steps.iso-key.outputs.save }}
+        run: |
+          [[ "$BUILT" == true ]] && key="$FRESH" || key="$MATCHED"
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: always()
+        env:
+          HOST: ${{ steps.host-cache.outputs.cache-hit == 'true' && '命中' || '构建' }}
+          BUILDER: ${{ steps.builder-cache.outputs.cache-hit == 'true' && '命中' || '构建' }}
+          KERNEL: ${{ steps.kernel.outputs.built == 'false' && '命中' || '构建' }}
+          ISO: ${{ steps.iso.outputs.built == 'false' && '命中' || '构建' }}
+          ISO_CACHE: ${{ inputs.iso_cache }}
+        run: |
+          {
+            echo "### base"
+            echo "| 产物 | 缓存 |"
+            echo "|---|---|"
+            echo "| 宿主容器 | ${HOST} |"
+            echo "| builder 容器 | ${BUILDER} |"
+            echo "| 内核（${KERNEL_BUILD_MODE}） | ${KERNEL} |"
+            echo "| base ISO（${ISO_CACHE}） | ${ISO} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  board:
+    name: board (${{ matrix.board }})
+    needs: [checks, base]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        board: ${{ fromJSON(needs.base.outputs.boards) }}
+    env:
+      BOARD: ${{ matrix.board }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Runner resources
+        run: |
+          {
+            echo "JOBS=$(nproc)"
+            echo "BUILD_CPUS=$(nproc)"
+            echo "BUILD_MEMORY=$(( $(awk '/MemTotal/ {print int($2/1048576)}' /proc/meminfo) - 1 ))g"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore host image
+        id: host-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/vyos-host.tar.zst
+          key: host-${{ runner.arch }}-${{ hashFiles('docker/**', 'scripts/docker-build.sh') }}
+
+      - name: Load host image
+        if: steps.host-cache.outputs.cache-hit == 'true'
+        run: zstd -dc ~/.cache/vyos-host.tar.zst | docker load && rm -f ~/.cache/vyos-host.tar.zst
+
+      - name: Sources cache key
+        id: src-key
+        run: |
+          inputs=$(sha256sum build.conf lib/sources.sh lib/aic8800.sh lib/r8125.sh families/*.conf "boards/$BOARD/board.conf" | sha256sum | cut -c1-24)
+          echo "key=src-${RUNNER_ARCH}-${BOARD}-${inputs}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore sources
+        id: src-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: work/src
+          key: ${{ steps.src-key.outputs.key }}
+          restore-keys: src-${{ runner.arch }}-${{ matrix.board }}-
+
+      # 恢复本板最近一份 U-Boot；引擎按 inputs.sha256 判断能否跳过，不能则重编。
+      - name: Restore U-Boot
+        id: uboot-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: work/uboot/${{ matrix.board }}
+          key: uboot-${{ runner.arch }}-${{ matrix.board }}-${{ github.run_id }}
+          restore-keys: uboot-${{ runner.arch }}-${{ matrix.board }}-
+
+      - name: Sources + U-Boot
+        run: .github/scripts/build "$BOARD" --stages sources,uboot
+
+      - name: U-Boot cache key
+        id: uboot-key
+        run: |
+          digest=$(.github/scripts/build "$BOARD" --digest uboot)
+          echo "key=uboot-${RUNNER_ARCH}-${BOARD}-${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Save U-Boot
+        if: steps.uboot-cache.outputs.cache-matched-key != steps.uboot-key.outputs.key
+        uses: actions/cache/save@v6
+        with:
+          path: work/uboot/${{ matrix.board }}
+          key: ${{ steps.uboot-key.outputs.key }}
+
+      - name: Restore kernel
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            work/vyos-build/packages/linux-image-*-vyos_*_arm64.deb
+            work/state/kernel-inputs.sha256
+            work/kernel/linux-${{ needs.base.outputs.kv }}
+          key: ${{ needs.base.outputs.kernel-key }}
+          fail-on-cache-miss: true
+
+      - name: Restore base ISO
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            work/iso/*.iso
+            work/state/iso-overlay.sha256
+            work/state/iso-path
+          key: ${{ needs.base.outputs.iso-key }}
+          fail-on-cache-miss: true
+
+      - name: Re-anchor restored ISO
+        run: |
+          isos=(work/iso/*.iso)
+          [[ ${#isos[@]} -eq 1 && -f "${isos[0]}" ]]
+          iso="${isos[0]}"
+          echo "$PWD/$iso" > work/state/iso-path
+          touch "$iso"
+
+      # 先于耗时的镜像阶段做 DT 契约检查（U-Boot 产物旁缓存了 .config 与控制 DTB）。
       - name: Verify A5E PCIe kernel and firmware DT contract
-        if: env.BOARD == 'a5e'
+        if: matrix.board == 'a5e'
         run: |
           tmp=$(mktemp -d)
           trap 'rm -rf "$tmp"' EXIT
           dpkg-deb -x work/vyos-build/packages/linux-image-*-vyos_*_arm64.deb "$tmp"
+          dtb=$(echo "$tmp"/usr/lib/linux-image-*-vyos/allwinner/sun55i-a527-cubie-a5e.dtb)
           python3 tests/a5e-pcie.py \
             --kernel-config "$tmp"/boot/config-*-vyos \
-            --kernel-dtb "$tmp"/usr/lib/linux-image-*-vyos/allwinner/sun55i-a527-cubie-a5e.dtb \
-            --uboot-config work/src/u-boot/.config \
-            --uboot-dtb work/src/u-boot/u-boot.dtb
-          python3 tests/aic8800.py \
-            --kernel-dtb "$tmp"/usr/lib/linux-image-*-vyos/allwinner/sun55i-a527-cubie-a5e.dtb \
-            --uboot-dtb work/src/u-boot/u-boot.dtb
+            --kernel-dtb "$dtb" \
+            --uboot-config work/uboot/a5e/u-boot.config \
+            --uboot-dtb work/uboot/a5e/u-boot.dtb
+          python3 tests/aic8800.py --kernel-dtb "$dtb" --uboot-dtb work/uboot/a5e/u-boot.dtb
+
+      - name: Board assets + image + per-board ISO
+        run: .github/scripts/build "$BOARD" --stages aic8800,r8125,oled,image,imgiso
 
       - name: Upload image
-        if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: vyos-${{ env.BOARD }}-image
+          name: vyos-${{ matrix.board }}
           path: |
             out/*.img.xz
             out/*.iso
             out/*.sha256
             out/*.json
           if-no-files-found: error
+          compression-level: 0
           retention-days: 14
 
-      # 失败时把构建日志/部分产物捞出来便于排查
+      - name: Summary
+        run: |
+          {
+            echo "### ${BOARD}"
+            echo '```'
+            (cd out && ls -lh --time-style=+ ./*.img.xz ./*.iso && cat ./*.sha256)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 只缓存干净检出：U-Boot/TF-A/驱动的构建产物与解包的 r8125 源不进缓存。
+      - name: Clean sources for cache
+        if: steps.src-cache.outputs.cache-hit != 'true'
+        run: |
+          for d in work/src/*/; do
+            if [[ -d "$d/.git" ]]; then
+              git -C "$d" checkout -q -- . && git -C "$d" clean -fdxq
+            else
+              rm -rf "$d"
+            fi
+          done
+
+      - name: Save sources
+        if: steps.src-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: work/src
+          key: ${{ steps.src-key.outputs.key }}
+
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: build-logs-${{ env.BOARD }}
+          name: build-logs-${{ matrix.board }}
           path: |
             work/*.log
             out/

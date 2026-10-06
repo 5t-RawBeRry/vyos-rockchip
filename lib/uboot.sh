@@ -31,7 +31,8 @@ stage_uboot() {
     log "U-Boot 输入未变，跳过（REBUILD_UBOOT=1 强制重编）：${artifact}"
     return 0
   fi
-  run rm -f "${stamp}" "${UBOOT_SRC}/${UBOOT_ARTIFACT}" || return
+  run rm -f "${stamp}" "${UBOOT_SRC}/${UBOOT_ARTIFACT}" \
+    "${UBOOT_OUT_DIR}/u-boot.config" "${UBOOT_OUT_DIR}/u-boot.dtb" || return
 
   # 固件：家族决定（rkbin 选 blob / TF-A 现编 …），结果是 U-Boot make 变量。
   FIRMWARE_MAKE_ARGS=()
@@ -78,6 +79,11 @@ stage_uboot() {
   [[ -f "${UBOOT_SRC}/${UBOOT_ARTIFACT}" ]] || [[ "${DRY_RUN:-0}" == "1" ]] \
     || fatal "U-Boot 构建结束但缺 ${UBOOT_ARTIFACT}"
   run install -Dm644 "${UBOOT_SRC}/${UBOOT_ARTIFACT}" "${artifact}" || return
+  # 配置与控制 DTB 随产物缓存：跳过重编时，DT 契约检查（tests/a5e-pcie.py 等）仍有输入。
+  [[ ! -f "${UBOOT_SRC}/.config" ]] \
+    || run install -m644 "${UBOOT_SRC}/.config" "${UBOOT_OUT_DIR}/u-boot.config" || return
+  [[ ! -f "${UBOOT_SRC}/u-boot.dtb" ]] \
+    || run install -m644 "${UBOOT_SRC}/u-boot.dtb" "${UBOOT_OUT_DIR}/u-boot.dtb" || return
   [[ "${DRY_RUN:-0}" == "1" ]] || printf '%s\n' "${digest}" > "${stamp}"
   log "U-Boot 产物：${artifact}"
 }

@@ -200,6 +200,12 @@ kernel_build_cross() {
   local cross_make=(make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-)
 
   kernel_cross_assert_deps
+  # KERNEL_CCACHE=1：编译器前置 ccache。每次都解包到同一路径，全新树照样命中；改补丁/DTS
+  # 只重编受影响的文件。--version 透传，CONFIG_CC_VERSION_TEXT 与输入指纹均不变。
+  if [[ "${KERNEL_CCACHE:-0}" == "1" ]]; then
+    command -v ccache >/dev/null || fatal "KERNEL_CCACHE=1 但宿主机缺 ccache"
+    cross_make+=(CC="ccache aarch64-linux-gnu-gcc" HOSTCC="ccache gcc")
+  fi
   [[ "${DRY_RUN:-0}" == "1" ]] && { log "dry-run：交叉编 ${kv} → packages/"; return 0; }
 
   # bindeb-pkg 把 deb 写在源码父目录；仅清理 packages/ 无法排除同版本旧包。
@@ -287,4 +293,31 @@ kernel_build_cross() {
     || fatal "内核 BTF 或包内 DAE 能力验收失败"
   run mkdir -p "${VYOS_BUILD_TREE}/packages"
   run cp -v "${imgdeb}" "${VYOS_BUILD_TREE}/packages/"
+  if [[ "${KERNEL_TREE_PRUNE:-0}" == "1" ]]; then
+    kernel_prune_tree "${src}" || fatal "内核树裁剪失败：${src}"
+  fi
+}
+
+# KERNEL_TREE_PRUNE=1：验收通过后把 ~14GiB 编译树换成外置模块构建集（同路径，r8125/aic8800
+# 不变）。主体由内核自己的 install-extmod-build 生成（即 linux-headers 包内容）；CC=HOSTCC
+# 使其保留宿主可执行的 scripts/，不按目标架构重编。另补三样 headers 包不带的：签名密钥
+# （MODULE_SIG_FORCE）、.config、去调试信息但保留 .BTF 的 vmlinux（模块 BTF 的 --btf_base）。
+# 带调试信息的完整 vmlinux 仍在同目录的 linux-image-*-dbg deb 里。任一步失败都保留原树。
+kernel_prune_tree() {
+  local src="$1" kit="$1.extmod" f
+  run rm -rf "${kit}" || return
+  ( cd "${src}" && srctree=. SRCARCH=arm64 CC=cc HOSTCC=cc MAKE=make \
+      sh scripts/package/install-extmod-build "${kit}" ) || return
+  run install -m644 "${src}/.config" "${kit}/.config" || return
+  run install -Dm600 "${src}/certs/signing_key.pem" "${kit}/certs/signing_key.pem" || return
+  run install -Dm644 "${src}/certs/signing_key.x509" "${kit}/certs/signing_key.x509" || return
+  run aarch64-linux-gnu-objcopy --strip-debug "${src}/vmlinux" "${kit}/vmlinux" || return
+  kernel_validate_btf "${kit}/vmlinux" || return
+  for f in Module.symvers include/config/kernel.release include/config/auto.conf \
+           scripts/sign-file scripts/mod/modpost scripts/basic/fixdep; do
+    [[ -s "${kit}/${f}" ]] || { echo "外置模块构建集缺 ${f}" >&2; return 1; }
+  done
+  run rm -rf "${src}" || return
+  run mv "${kit}" "${src}" || return
+  log "内核树已裁剪为外置模块构建集：${src}"
 }

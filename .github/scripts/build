@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# CI 入口：与本地相同，经 scripts/docker-build.sh 在 docker/Dockerfile.host 宿主容器里跑
+# scripts/build.sh（参数原样透传，含 --digest）。容器以 root 写 work/、out/；结束后把
+# 缓存涉及的路径交还 runner 用户，actions/cache 才能读取（如 0600 的签名密钥）并解包恢复。
+# 只改这些路径：失败的镜像阶段可能在 work/ 下留有 /dev、/proc 挂载，不能递归整个 work/。
+set -Eeuo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+
+rc=0
+scripts/docker-build.sh "$@" || rc=$?
+
+owner="$(id -u):$(id -g)"
+sudo chown "${owner}" work work/vyos-build 2>/dev/null || true
+for path in work/state work/kernel work/iso work/src work/uboot work/ccache \
+            work/vyos-build/packages out; do
+  [[ ! -e "${path}" ]] || sudo chown -R "${owner}" "${path}"
+done
+exit "${rc}"

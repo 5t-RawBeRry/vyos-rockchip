@@ -4,6 +4,7 @@
 #   scripts/build.sh e20c                 # 全链：deps→sources→overlay→builder→kernel→iso→uboot→image
 #   scripts/build.sh e20c --dry-run       # 只解析配置、打印计划与缓存状态，不构建不联网不 sudo
 #   scripts/build.sh --stages kernel,iso  # 板无关阶段可不带板名
+#   scripts/build.sh --digest kernel      # 只打印缓存输入指纹（kernel|iso|builder|uboot），供 CI 作缓存 key
 #   REBUILD_KERNEL=1 / REBUILD_ISO=1 / REBUILD_UBOOT=1 / REFRESH_SOURCES=1 / SKIP_FETCH=1
 #
 # 阶段全部幂等：昂贵产物（内核 deb / ISO / U-Boot bin）有缓存即跳过。
@@ -26,7 +27,7 @@ ALL_STAGES=(deps sources overlay builder kernel iso aic8800 r8125 oled uboot ima
 BOARD_STAGES=(uboot image imgiso)   # 需要板名的阶段（aic8800/r8125/oled 内部按 BOARD_* 判断，无板时自跳过）
 
 usage() {
-  sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -34,11 +35,14 @@ usage() {
 BOARD=""
 DRY_RUN="${DRY_RUN:-0}"
 STAGES_CSV=""
+DIGEST_OF=""
 while (($#)); do
   case "$1" in
     --dry-run)   DRY_RUN=1 ;;
     --stages)    STAGES_CSV="${2:?--stages 需要参数}"; shift ;;
     --stages=*)  STAGES_CSV="${1#*=}" ;;
+    --digest)    DIGEST_OF="${2:?--digest 需要参数（kernel|iso|builder|uboot）}"; shift ;;
+    --digest=*)  DIGEST_OF="${1#*=}" ;;
     -h|--help)   usage 0 ;;
     -*)          fatal "未知参数：$1（--help 看用法）" ;;
     *)           [[ -z "${BOARD}" ]] || fatal "板名只能给一个：${BOARD} vs $1"
@@ -50,6 +54,8 @@ export DRY_RUN
 
 if [[ -n "${STAGES_CSV}" ]]; then
   IFS=',' read -r -a PLAN <<< "${STAGES_CSV}"
+elif [[ -n "${DIGEST_OF}" ]]; then
+  PLAN=()   # 只算指纹，不执行任何阶段
 else
   PLAN=("${ALL_STAGES[@]}")
 fi
@@ -79,6 +85,20 @@ for m in env deps sources overlay builder kernel iso aic8800 r8125 oled uboot im
   # shellcheck source=/dev/null
   source "${LIB_DIR}/${m}.sh"
 done
+
+# 指纹即各阶段判定“可跳过”的同一函数：CI 用它作缓存 key，key 命中 ⇔ 阶段会跳过。
+# stdout 只有一行 sha256；前置条件不足（树未取、builder 镜像不在）则非零退出，调用方须检查退出码。
+if [[ -n "${DIGEST_OF}" ]]; then
+  case "${DIGEST_OF}" in
+    kernel)  kernel_inputs_digest ;;
+    iso)     iso_overlay_digest ;;
+    builder) builder_context_digest ;;
+    uboot)   [[ -n "${BOARD}" ]] || fatal "--digest uboot 需要板名"
+             uboot_inputs_digest ;;
+    *)       fatal "未知 --digest：${DIGEST_OF}（可选：kernel iso builder uboot）" ;;
+  esac
+  exit 0
+fi
 
 # Refuse an incompatible full plan before spending time building a container kernel.
 if [[ "${KERNEL_BUILD_MODE}" == container ]] && stage_planned kernel; then

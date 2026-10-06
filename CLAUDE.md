@@ -446,20 +446,30 @@ IFF_UP 再调**（eth1 无网线也算 admin-up，最多 ~120s）。
 （实测报错）。`lib/iso.sh` 固定传 **`--build-type release`**（只多一段 EULA includes，
 对路由成品镜像更干净更瘦，且去掉那次 docker 拉取）。
 
-## CI：GitHub Actions 原生 arm64（.github/workflows/build.yml）
-`runs-on: ubuntu-24.04-arm`（原生 arm64，**无 qemu** → lb build 不再被仿真拖，相对本地 x86 提速
-5–10×）。**仅手动触发**（`workflow_dispatch`，选板型；故意不挂 push 触发，免每次提交白跑）。
-- **跳过 `deps` 阶段**：它的 qemu-binfmt 检查在原生 arm64 上会误报 fatal（原生不需要 binfmt）；
-  依赖改用 apt 装。`KERNEL_BUILD_MODE=cross`（r8125/aic8800 要宿主侧内核树）。
-- **官方 `vyos/vyos-build:current` 是单架构 amd64**（没有 arm64 变体——其 manifest 是单个 v2
-  manifest，不是多架构 manifest list）。arm64 runner 上 `docker pull --platform linux/arm64`
-  只会拿到那唯一的 amd64，`builder.sh` 判出不对会回退「用 `work/vyos-build/docker` 的 Dockerfile
-  本地原生构 arm64 容器」——结果正确但白拉一趟。故 CI 里设 **`BUILDER_PULL=0`** 直接走本地构建。
-- **三道 actions/cache**：① `work/src`（u-boot/rkbin 等克隆，省下载）；② `work/kernel`+输入指纹
-  （内核片段/补丁没变就跳过重编，且这棵已编树供 r8125/aic8800 编 out-of-tree 模块）；③ 本地构的
-  arm64 builder 容器镜像（`docker save|zstd`，key=`builder-<arch>-vN`，vyos-build Dockerfile
-  变了就 bump 版本刷新）。**base ISO 不缓存**：每次全新 lb build（VyOS rolling 包集会动，求新鲜）。
-- 产物 `out/*.img.xz` 传 artifact。手动跑：`gh workflow run build-image -R <owner>/vyos-sbc -f board=a5e`。
+## CI：GitHub Actions 原生 arm64（.github/workflows/build.yml，2026-10-06 重写）
+`runs-on: ubuntu-24.04-arm`（原生 arm64，**无 qemu**）。**仅手动触发**（`workflow_dispatch`：
+board=a5e|e20c|m28k|r5s|e52c|all、kernel_mode、iso_cache）。
+- **与本地同一条构建路径**：`.github/scripts/build` → `scripts/docker-build.sh` → 在
+  `docker/Dockerfile.host` 宿主容器里跑 `build.sh`（Debian trixie gcc / pahole 1.30，与 andy/v2in0
+  一致；runner 自带的 Ubuntu gcc13/pahole 1.25 不参与构建）。容器以 root 写 work/，入口脚本事后只把
+  缓存涉及的路径 chown 回 runner（0600 签名密钥才进得了缓存）；不递归整个 work/（失败的 image
+  阶段可能留 /dev、/proc 挂载）。不跑 `deps` 阶段（其 qemu-binfmt 检查在原生 arm64 误报）。
+- **三个 job**：checks（离线回归 + ShellCheck，与 base 并行）→ base（宿主容器 → builder → 内核 →
+  base ISO，板无关）→ board matrix（U-Boot → 外置驱动 → img.xz + 每板 ISO）。all = 五板并行，
+  内核与 base ISO 只算一次。
+- **缓存 key = 引擎指纹**：`build.sh --digest kernel|iso|builder|uboot` 打印的就是各阶段判定
+  “可跳过”的同一个函数输出（含 `BUILD_HOST_IMAGE_ID`），key 命中 ⇔ 阶段跳过。内核/ISO 以
+  “指纹-run_id”唯一 key 保存、按前缀恢复，board job 按 base 实际用的 key 精确恢复 → ISO 里的内核
+  与外置模块签名密钥必出自同一次构建（防并发 run 串 key 导致 MODULE_SIG_FORCE 拒载）。
+- **各缓存**：host 镜像（docker save；`docker-build.sh` 按 docker/ 上下文标签复用已有镜像，
+  否则全新 runner 重跑 apt 会换层摘要、连带内核指纹失效）；builder 镜像；内核 = deb + stamp +
+  **`KERNEL_TREE_PRUNE=1` 裁剪后的树**（~14GiB → 外置模块构建集，见内核模式一节）；ccache
+  （`KERNEL_CCACHE=1`，内核未命中时增量重编）；base ISO（`iso_cache`：daily=当天同输入复用，
+  reuse=同输入即复用，off=总重建——rolling 软件源每天变，默认 daily 折中）；每板 src（干净克隆）
+  与 U-Boot（产物旁另存 `u-boot.config`/`u-boot.dtb` 供 A5E DT 契约检查，跳过重编时也有输入）。
+- **`BUILDER_PULL=0`**：官方 `vyos/vyos-build:current` 只有 amd64，arm64 上 pull 白拉一趟。
+- 产物 artifact `vyos-<板>`（img.xz + ISO + sha256）。手动跑：
+  `gh workflow run build-image -R <owner>/vyos-sbc -f board=a5e`。
 
 ## 内核两种构建模式（KERNEL_BUILD_MODE）
 container = 官方 build.py 进 arm64 容器；cross（默认）= 宿主机交叉 bindeb-pkg
@@ -467,6 +477,11 @@ container = 官方 build.py 进 arm64 容器；cross（默认）= 宿主机交�
 不带 BUILD_TOOLS=perf——它在 arm64 有并行竞态且镜像不装）。cross 树在
 work/kernel/（host 属主），每次全新解包保证确定性。6.18 kbuild 的 debian/rules 已 debhelper 化 → 宿主机需 debhelper（Arch 走 AUR），且必须 DPKG_FLAGS=-d（Arch 无 dpkg 包数据库，checkbuilddeps 必误报）。迭代 DTS 用
 `KERNEL_BUILD_MODE=cross make m28k`（指纹机制会自动触发重编）。
+两个可选开关（默认关，CI 开）：`KERNEL_CCACHE=1` 给 cross 编译套 ccache（同路径解包故全新树也命中）；
+`KERNEL_TREE_PRUNE=1` 在 deb 验收后用内核自带 `scripts/package/install-extmod-build`（即 headers 包
+内容，CC=HOSTCC 保留宿主可执行 scripts/）把 14GiB 树换成外置模块构建集，另补签名密钥、`.config`、
+`--strip-debug` 但保留 .BTF 的 vmlinux（模块 BTF 的 --btf_base）；路径不变，r8125/aic8800 照用，任一步
+失败保留原树。带调试信息的完整 vmlinux 仍在同目录的 dbg deb 里。
 
 ## 真机调试已踩过的坑（2026-06-13，e20c 首跑）
 - **console speed 1500000 不在 vyos-1x 白名单**（只到 115200）→ 首次 commit 在

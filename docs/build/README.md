@@ -60,6 +60,21 @@ KERNEL_BUILD_MODE=cross REBUILD_KERNEL=1 make a5e
 
 ## GitHub Actions
 
-[`build-image`](../../.github/workflows/build.yml) 仅手动触发，使用原生 arm64 运行器。在 Actions 中选择设备和内核模式即可构建，默认 A5E / cross；不会因普通 push 自动构建全部设备。
+[`build-image`](../../.github/workflows/build.yml) 仅手动触发，使用原生 arm64 运行器。在 Actions 中选择设备（单板或 `all` 五板并行）、内核模式和 base ISO 复用策略即可构建，默认 A5E / cross / daily；不会因普通 push 自动构建全部设备。
 
-流程缓存源码、内核与构建容器，并上传镜像产物。CI 构建和离线回归通过不等于真机验收通过。
+```sh
+gh workflow run build-image -R <owner>/vyos-sbc -f board=a5e            # 默认
+gh workflow run build-image -R <owner>/vyos-sbc -f board=all -f iso_cache=off
+```
+
+CI 与本地走同一条路径：经 `scripts/docker-build.sh` 在 `docker/Dockerfile.host` 宿主容器内构建，工具链与本地验证环境一致。缓存 key 直接取 `scripts/build.sh --digest <kernel|iso|builder|uboot>` 输出的阶段输入指纹，因此缓存命中与阶段跳过严格对应：
+
+| 缓存 | 内容 | 失效条件 |
+|---|---|---|
+| host / builder | 宿主容器、vyos-build 构建容器（`docker save`） | `docker/` 或 vyos-build `docker/` 变化 |
+| kernel | 内核 deb、输入指纹、裁剪后的外置模块构建集 | 内核补丁、配置片段、vyos-build、工具链变化 |
+| ccache | 内核编译对象 | 内核未命中时用于增量重编 |
+| iso | base ISO | 输入变化；另按 `iso_cache`：`daily` 当天复用、`reuse` 不限日期、`off` 总是重建 |
+| src / uboot | 每板干净源码克隆、U-Boot 产物 | 源码 ref 或 U-Boot 输入变化 |
+
+产物为每板一个 artifact（`.img.xz`、`.iso` 与校验文件），Summary 页列出各缓存是否命中。CI 构建和离线回归通过不等于真机验收通过。

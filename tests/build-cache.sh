@@ -325,6 +325,72 @@ host_image_inputs() {
   BUILD_HOST_IMAGE_ID=sha256:changed
   [[ "${kernel}" != "$(kernel_inputs_digest)" && "${uboot}" != "$(uboot_inputs_digest)" ]]
 }
+kernel_ccache() {
+  kernel_cross_fixture
+  ccache() { :; }
+  make() {
+    printf '%s\n' "$@" > "${TMP}/make-args"
+    make_image_deb "${WORK_DIR}/kernel/linux-image-6.18.1-vyos_6.18.1-1_arm64.deb"
+  }
+  KERNEL_BUILD_MODE=cross
+  KERNEL_CCACHE=1
+  stage_kernel
+  grep -qx 'CC=ccache aarch64-linux-gnu-gcc' "${TMP}/make-args"
+  grep -qx 'HOSTCC=ccache gcc' "${TMP}/make-args"
+}
+kernel_prune_fixture() {
+  KSRC="${WORK_DIR}/kernel/linux-6.18.1"
+  mkdir -p "${KSRC}/scripts/package" "${KSRC}/certs" "${KSRC}/drivers"
+  echo object > "${KSRC}/drivers/big.o"
+  echo CONFIG_BPF=y > "${KSRC}/.config"
+  echo key > "${KSRC}/certs/signing_key.pem"
+  echo cert > "${KSRC}/certs/signing_key.x509"
+  echo elf > "${KSRC}/vmlinux"
+  # Stand-in for the kernel's own kit generator: checks the host-scripts contract.
+  cat > "${KSRC}/scripts/package/install-extmod-build" <<'KIT'
+#!/bin/sh
+set -eu
+[ "${CC}" = "${HOSTCC}" ] && [ "${srctree}" = . ] && [ "${SRCARCH}" = arm64 ]
+for f in Module.symvers include/config/kernel.release include/config/auto.conf \
+         scripts/sign-file scripts/mod/modpost scripts/basic/fixdep; do
+  mkdir -p "$1/$(dirname "${f}")"
+  echo kit > "$1/${f}"
+done
+[ "${EXTMOD_FAIL:-0}" = 0 ]
+KIT
+  aarch64-linux-gnu-objcopy() { cp "${@: -2:1}" "${@: -1}"; }
+  kernel_validate_btf() { [[ -s "$1" ]]; }
+}
+kernel_tree_prune() {
+  local f
+  kernel_prune_fixture
+  kernel_prune_tree "${KSRC}"
+  [[ ! -e "${KSRC}/drivers/big.o" && ! -e "${KSRC}.extmod" ]] || return 1
+  for f in Module.symvers .config certs/signing_key.pem certs/signing_key.x509 vmlinux scripts/sign-file; do
+    [[ -s "${KSRC}/${f}" ]] || return 1
+  done
+}
+kernel_tree_prune_keeps_tree_on_failure() {
+  kernel_prune_fixture
+  export EXTMOD_FAIL=1
+  if kernel_prune_tree "${KSRC}"; then return 1; fi
+  [[ -s "${KSRC}/drivers/big.o" && -s "${KSRC}/certs/signing_key.pem" ]]
+}
+uboot_exports_config_dtb() {
+  make() { touch "${UBOOT_SRC}/u-boot-rockchip.bin"; echo CONFIG_A=y > "${UBOOT_SRC}/.config"; echo dtb > "${UBOOT_SRC}/u-boot.dtb"; }
+  stage_uboot
+  [[ -s "${UBOOT_OUT_DIR}/u-boot.config" && -s "${UBOOT_OUT_DIR}/u-boot.dtb" ]]
+}
+# The CLI must print exactly the stage's own fingerprint, and reject unknown domains.
+digest_cli() {
+  local out
+  mkdir -p "${VYOS_BUILD_TREE}/docker"
+  echo 'FROM scratch' > "${VYOS_BUILD_TREE}/docker/Dockerfile"
+  out="$(WORK_DIR="${WORK_DIR}" "${BASH}" "${ROOT}/scripts/build.sh" --digest builder)"
+  source "${ROOT}/lib/builder.sh"
+  [[ "${out}" =~ ^[0-9a-f]{64}$ && "${out}" == "$(builder_context_digest)" ]] || return 1
+  if WORK_DIR="${WORK_DIR}" "${BASH}" "${ROOT}/scripts/build.sh" --digest bogus; then return 1; fi
+}
 kernel_package_validation() {
   local deb="${TMP}/image.deb"
   make_image_deb "${deb}"
@@ -340,7 +406,7 @@ PYTEST
 
 if (($#)); then fixture; "$1"; exit; fi
 failed=0
-for test in source_sha source_changed_ref source_same_head source_offline_mismatch source_outside_work source_work_root_alias source_symlink_escape cache_fail_closed uboot_cache_reuse uboot_required_patches kernel_recipe kernel_certificate kernel_builder kernel_mode kernel_stale_deb kernel_new_deb kernel_corrupt_new_deb kernel_container_new_deb kernel_container_corrupt_deb kernel_package_validation overlay_owner_flags overlay_deleted_files host_image_inputs iso_inputs uboot_inputs uboot_unstamped uboot_tfa_build; do
+for test in source_sha source_changed_ref source_same_head source_offline_mismatch source_outside_work source_work_root_alias source_symlink_escape cache_fail_closed uboot_cache_reuse uboot_required_patches kernel_recipe kernel_certificate kernel_builder kernel_mode kernel_stale_deb kernel_new_deb kernel_corrupt_new_deb kernel_container_new_deb kernel_container_corrupt_deb kernel_package_validation overlay_owner_flags overlay_deleted_files host_image_inputs iso_inputs uboot_inputs uboot_unstamped uboot_tfa_build kernel_ccache kernel_tree_prune kernel_tree_prune_keeps_tree_on_failure uboot_exports_config_dtb digest_cli; do
   if "${BASH}" "$0" "${test}" > /dev/null 2>&1; then printf 'PASS %s\n' "${test}"; else printf 'FAIL %s\n' "${test}"; failed=$((failed+1)); fi
 done
 ((failed == 0))
