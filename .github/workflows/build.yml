@@ -58,6 +58,9 @@ env:
   CCACHE_DIR: ${{ github.workspace }}/work/ccache
   CCACHE_MAXSIZE: 3G
   CCACHE_COMPILERCHECK: content
+  # 内核树目录名带版本号（linux-6.18.x）；不把 cwd 计入哈希，内核小版本升级时未改动的
+  # 文件照样命中（代价：命中对象 DWARF 的 comp_dir 指向旧目录，BTF 不受影响）。
+  CCACHE_NOHASHDIR: "true"
   HOST_IMAGE: vyos-sbc/host:local
   # 官方 vyos/vyos-build:current 只有 amd64；arm64 上直接用 vyos-build docker/ 本地构建。
   BUILDER_IMAGE: vyos-sbc/builder:rolling
@@ -132,12 +135,23 @@ jobs:
           } >> "$GITHUB_ENV"
 
       # ── 宿主容器 ────────────────────────────────────────────────────────────
+      # 与 docker-build.sh 给镜像打的上下文标签同一算法（docker/ 内容 + CLI 镜像名）：只有
+      # 宿主环境真变了才换 key，改 docker-build.sh 其它部分不会连带内核/U-Boot 缓存失效。
+      - name: Host image key
+        id: host-key
+        run: |
+          # shellcheck disable=SC2016 # literal ${DOCKER_CLI_IMAGE:-...} in the sed pattern
+          cli=$(sed -n 's/^DOCKER_CLI_IMAGE="\${DOCKER_CLI_IMAGE:-\(.*\)}"$/\1/p' scripts/docker-build.sh)
+          [[ -n "$cli" ]]
+          context=$({ printf '%s\n' "$cli"; cd docker && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum; } | sha256sum | cut -d' ' -f1)
+          echo "key=host-${RUNNER_ARCH}-${context}" >> "$GITHUB_OUTPUT"
+
       - name: Restore host image
         id: host-cache
         uses: actions/cache/restore@v6
         with:
           path: ~/.cache/vyos-host.tar.zst
-          key: host-${{ runner.arch }}-${{ hashFiles('docker/**', 'scripts/docker-build.sh') }}
+          key: ${{ steps.host-key.outputs.key }}
 
       - name: Load host image
         if: steps.host-cache.outputs.cache-hit == 'true'
@@ -380,12 +394,23 @@ jobs:
             echo "BUILD_MEMORY=$(( $(awk '/MemTotal/ {print int($2/1048576)}' /proc/meminfo) - 1 ))g"
           } >> "$GITHUB_ENV"
 
+      # 与 docker-build.sh 给镜像打的上下文标签同一算法（docker/ 内容 + CLI 镜像名）：只有
+      # 宿主环境真变了才换 key，改 docker-build.sh 其它部分不会连带内核/U-Boot 缓存失效。
+      - name: Host image key
+        id: host-key
+        run: |
+          # shellcheck disable=SC2016 # literal ${DOCKER_CLI_IMAGE:-...} in the sed pattern
+          cli=$(sed -n 's/^DOCKER_CLI_IMAGE="\${DOCKER_CLI_IMAGE:-\(.*\)}"$/\1/p' scripts/docker-build.sh)
+          [[ -n "$cli" ]]
+          context=$({ printf '%s\n' "$cli"; cd docker && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum; } | sha256sum | cut -d' ' -f1)
+          echo "key=host-${RUNNER_ARCH}-${context}" >> "$GITHUB_OUTPUT"
+
       - name: Restore host image
         id: host-cache
         uses: actions/cache/restore@v6
         with:
           path: ~/.cache/vyos-host.tar.zst
-          key: host-${{ runner.arch }}-${{ hashFiles('docker/**', 'scripts/docker-build.sh') }}
+          key: ${{ steps.host-key.outputs.key }}
 
       - name: Load host image
         if: steps.host-cache.outputs.cache-hit == 'true'
