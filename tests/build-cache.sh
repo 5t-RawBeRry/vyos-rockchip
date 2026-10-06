@@ -19,6 +19,8 @@ fixture() {
   BOARD_FAMILY=rockchip; FAMILY_CONF="${ROOT}/families/rockchip.conf"; source "${FAMILY_CONF}"
   VYOS_VERSION="test-1"; BUILD_BY=builder; FLAVOR=sbc; BUILDER_IMAGE="test"
   KERNEL_BUILD_MODE=container; JOBS=1; MOCK_BUILDER=sha256:one
+  # Optional build knobs may be exported by the caller (CI sets them); tests opt in explicitly.
+  KERNEL_TREE_PRUNE=0; KERNEL_CCACHE=0
   mkdir -p "${STATE_DIR}" "${LIB_DIR}" "${OVERLAY_DIR}" "${BOARDS_DIR}/test/overlay" "${ISO_KEEP_DIR}" "${UBOOT_OUT_DIR}"
   cp "${ROOT}/lib/"{sources,kernel,iso,uboot,overlay}.sh "${LIB_DIR}/"
   for module in sources kernel iso uboot overlay; do source "${LIB_DIR}/${module}.sh"; done
