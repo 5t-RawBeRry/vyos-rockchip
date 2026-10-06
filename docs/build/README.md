@@ -7,11 +7,11 @@
 以下命令均在仓库根目录的 Linux 构建环境中执行：
 
 ```bash
-make a5e-dry    # 静态预览：不构建、不联网、不 sudo
-make a5e        # 完整构建 A5E
+make e52c-dry   # 静态预览：不构建、不联网、不 sudo
+make e52c       # 完整构建 E52C
 ```
 
-当前调试目标为 A5E，裸 `make` 也只构建 A5E。其他设备仍可显式指定；`make all` 会构建全部设备，不用于当前单板调试。
+当前主用设备为 E52C，裸 `make` 也只构建 E52C。其他设备仍可显式指定；`make all` 会构建全部设备，不用于当前单板调试。
 
 完整流程为：依赖与源码 → overlay → builder → 内核 → 共享基础 ISO → 板级资产 → U-Boot → 整盘镜像 → 板级升级 ISO。
 
@@ -22,10 +22,10 @@ make a5e        # 完整构建 A5E
 使用仓库提供的 host 工具容器，可避免在宿主机安装整套编译依赖：
 
 ```bash
-scripts/docker-build.sh a5e
+scripts/docker-build.sh e52c
 ```
 
-该入口仍会构建 host 工具镜像，即使传入 `--dry-run` 也会启动 Docker。真正只看计划请用 `make a5e-dry`。
+该入口仍会构建 host 工具镜像，即使传入 `--dry-run` 也会启动 Docker。真正只看计划请用 `make e52c-dry`。
 
 镜像组装涉及 loop、挂载和 chroot，工具容器需要特权及 Docker socket；这是依赖隔离，**不是不可信代码的安全沙箱**。资源限制、共享宿主保护要求见[容器隔离边界](maintenance.md#容器隔离边界)。
 
@@ -42,10 +42,10 @@ Arch / CachyOS 的依赖参考：`docker`、`qemu-user-static`、`aarch64-linux-
 
 A5E、M28K、R5S、E52C 的外置驱动需要 `cross`；E20C 可选择 `container`。不兼容的完整构建计划会提前拒绝。
 
-例如重建 A5E 内核：
+例如重建 E52C 内核：
 
 ```bash
-KERNEL_BUILD_MODE=cross REBUILD_KERNEL=1 make a5e
+KERNEL_BUILD_MODE=cross REBUILD_KERNEL=1 make e52c
 ```
 
 `WORK_DIR` / `OUT_DIR` 可指定中间件和产物目录；`JOBS`、`BUILD_CPUS`、`BUILD_MEMORY` 等参数用于容器资源控制。先保留经过验证的默认值，不要把提高并行数视为必然提速。
@@ -60,10 +60,10 @@ KERNEL_BUILD_MODE=cross REBUILD_KERNEL=1 make a5e
 
 ## GitHub Actions
 
-[`build-image`](../../.github/workflows/build.yml) 仅手动触发，使用原生 arm64 运行器。在 Actions 中选择设备（单板或 `all` 五板并行）、内核模式和 base ISO 复用策略即可构建，默认 A5E / cross / daily；不会因普通 push 自动构建全部设备。
+[`build-image`](../../.github/workflows/build.yml) 仅手动触发，使用原生 arm64 运行器。在 Actions 中选择设备（单板或 `all` 五板并行）、内核模式和 base ISO 复用策略即可构建，默认 E52C / cross / daily；不会因普通 push 自动构建全部设备。
 
 ```sh
-gh workflow run build-image -R <owner>/vyos-sbc -f board=a5e            # 默认
+gh workflow run build-image -R <owner>/vyos-sbc -f board=e52c           # 默认
 gh workflow run build-image -R <owner>/vyos-sbc -f board=all -f iso_cache=off
 ```
 

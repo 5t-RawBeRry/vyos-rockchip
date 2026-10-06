@@ -27,8 +27,8 @@ on:
       board:
         description: "设备（all = 五板并行）"
         type: choice
-        options: [a5e, e20c, m28k, r5s, e52c, all]
-        default: a5e
+        options: [e52c, a5e, e20c, m28k, r5s, all]
+        default: e52c
       kernel_mode:
         description: "内核构建方式（带外置驱动的板必须 cross；container 只适合 e20c）"
         type: choice

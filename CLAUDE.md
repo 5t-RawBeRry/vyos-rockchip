@@ -1,7 +1,9 @@
 # CLAUDE.md — 项目向导（给 Claude Code 看的）
 
 ## 当前调试约束（2026-09-22，用户明确要求）
-- **只构建 A5E**，不要自动跑四块 Rockchip 板或 `make all`；默认 `make` / CI 选板改为 A5E。
+- **主用 E52C（2026-10-07 用户明确，取代此前“只构建 A5E”）**：默认 `make`、CI `build-image`
+  选板、`vyos-rolling` 验证构建均为 E52C；其他板显式指定，不要自动跑 `make all`。下面 A5E 的
+  bring-up 记录保留作历史与参考。
 - 整盘默认 **`.img.xz`**（`XZ_LEVEL=6`），供 Etcher 直接刷；不再默认生成 `.img.zst`。
 - **最新进展（10:54）**：0545 的 SD/NVMe 系统与介质 UUID 隔离均已实测；用户授权清空的
   FORESEE E2M2 64GB 已完成安装、完整 4 GiB 读回、扩容至 57.4 GiB 及文件直接读写测试。
@@ -448,7 +450,7 @@ IFF_UP 再调**（eth1 无网线也算 admin-up，最多 ~120s）。
 
 ## CI：GitHub Actions 原生 arm64（.github/workflows/build.yml，2026-10-06 重写）
 `runs-on: ubuntu-24.04-arm`（原生 arm64，**无 qemu**）。**仅手动触发**（`workflow_dispatch`：
-board=a5e|e20c|m28k|r5s|e52c|all、kernel_mode、iso_cache）。
+board=e52c（默认）|a5e|e20c|m28k|r5s|all、kernel_mode、iso_cache）。
 - **与本地同一条构建路径**：`.github/scripts/build` → `scripts/docker-build.sh` → 在
   `docker/Dockerfile.host` 宿主容器里跑 `build.sh`（Debian trixie gcc / pahole 1.30，与 andy/v2in0
   一致；runner 自带的 Ubuntu gcc13/pahole 1.25 不参与构建）。容器以 root 写 work/，入口脚本事后只把
@@ -478,7 +480,7 @@ board=a5e|e20c|m28k|r5s|e52c|all、kernel_mode、iso_cache）。
   不一致 = 上游换内核过渡期，本轮不动。官方 nightly 镜像发版滞后于软件源（10-06 时 nightly 仍是
   09-30/6.18.50），所以跟的是软件源而非 nightly。自动跟进只保证可构建，实机验证另走发版流程。
 - 产物 artifact `vyos-<板>`（img.xz + ISO + sha256）。手动跑：
-  `gh workflow run build-image -R <owner>/vyos-sbc -f board=a5e`。
+  `gh workflow run build-image -R <owner>/vyos-sbc -f board=e52c`。
 
 ## 内核两种构建模式（KERNEL_BUILD_MODE）
 container = 官方 build.py 进 arm64 容器；cross（默认）= 宿主机交叉 bindeb-pkg

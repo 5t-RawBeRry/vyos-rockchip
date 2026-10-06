@@ -18,8 +18,8 @@ on:
       board:
         description: "验证构建用的设备"
         type: choice
-        options: [a5e, e20c, m28k, r5s, e52c, all]
-        default: a5e
+        options: [e52c, a5e, e20c, m28k, r5s, all]
+        default: e52c
 
 concurrency:
   group: vyos-rolling
@@ -38,7 +38,7 @@ env:
   GH_TOKEN: ${{ github.token }}
   GH_REPO: ${{ github.repository }}
   BRANCH: bump/vyos-rolling
-  BOARD: ${{ inputs.board || 'a5e' }}
+  BOARD: ${{ inputs.board || 'e52c' }}
 
 jobs:
   follow:
