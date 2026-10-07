@@ -15,7 +15,7 @@ BUILD_CPUS="${BUILD_CPUS:-16}"
 BUILD_MEMORY="${BUILD_MEMORY:-32g}"
 BUILDER_CPUS="${BUILDER_CPUS:-${BUILD_CPUS}}"
 BUILDER_MEMORY="${BUILDER_MEMORY:-${BUILD_MEMORY}}"
-HOST_IMAGE="${HOST_IMAGE:-vyos-rockchip/host:local}"
+HOST_IMAGE="${HOST_IMAGE:-vyos-sbc/host:local}"
 DOCKER_SOCKET="${DOCKER_SOCKET:-/var/run/docker.sock}"
 
 for value in "${JOBS}" "${BUILD_CPUS}" "${BUILDER_CPUS}"; do
@@ -30,11 +30,31 @@ docker_host=(docker --host "unix://${DOCKER_SOCKET}")
 
 # Do not source build.conf here: its bootstrap may use tools (nproc, etc.) that
 # belong inside the host image. Pass overrides and load configuration there.
-"${docker_host[@]}" build \
-  --build-arg "DOCKER_CLI_IMAGE=${DOCKER_CLI_IMAGE:-docker:29.8.0-cli}" \
-  -f "${PROJECT_ROOT}/docker/Dockerfile.host" -t "${HOST_IMAGE}" "${PROJECT_ROOT}/docker"
+# The image is labelled with its build context; an image already carrying that label
+# is reused as-is. A rebuild without BuildKit cache (fresh CI runner, pruned cache)
+# re-runs apt and yields new layers, i.e. a new identity below; reuse keeps it stable,
+# so an image restored with `docker load` keeps the kernel/U-Boot caches valid.
+DOCKER_CLI_IMAGE="${DOCKER_CLI_IMAGE:-docker:29.8.0-cli}"
+HOST_CONTEXT="$({ printf '%s\n' "${DOCKER_CLI_IMAGE}"
+  cd "${PROJECT_ROOT}/docker" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum
+} | sha256sum | cut -d' ' -f1)"
+if [[ "$("${docker_host[@]}" image inspect -f '{{index .Config.Labels "org.vyos-sbc.host-context-sha256"}}' \
+        "${HOST_IMAGE}" 2>/dev/null)" != "${HOST_CONTEXT}" ]]; then
+  # stderr only: stdout belongs to build.sh (e.g. `--digest`).
+  "${docker_host[@]}" build \
+    --build-arg "DOCKER_CLI_IMAGE=${DOCKER_CLI_IMAGE}" \
+    --label "org.vyos-sbc.host-context-sha256=${HOST_CONTEXT}" \
+    -f "${PROJECT_ROOT}/docker/Dockerfile.host" -t "${HOST_IMAGE}" "${PROJECT_ROOT}/docker" >&2
+fi
 HOST_IMAGE_ID="$("${docker_host[@]}" image inspect -f '{{.Id}}' "${HOST_IMAGE}")"
 [[ "${HOST_IMAGE_ID}" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'invalid host image identity' >&2; exit 1; }
+# Cache identity handed to the build (BUILD_HOST_IMAGE_ID, part of the kernel/U-Boot
+# fingerprints) is the RootFS layer digest list, NOT the image ID: BuildKit assigns a
+# fully cache-hit rebuild a new image ID on every invocation, which would rebuild the
+# kernel deb and then the base ISO for every single board. Identical layers ⇒ identical
+# toolchain ⇒ identical identity; a real Dockerfile/apt change alters the layers.
+HOST_IMAGE_IDENTITY="rootfs:$("${docker_host[@]}" image inspect -f '{{range .RootFS.Layers}}{{.}}{{"\n"}}{{end}}' "${HOST_IMAGE}" | sha256sum | cut -d' ' -f1)"
+[[ "${HOST_IMAGE_IDENTITY}" =~ ^rootfs:[0-9a-f]{64}$ ]] || { echo 'invalid host image layer identity' >&2; exit 1; }
 
 mkdir -p "${WORK_DIR:-${PROJECT_ROOT}/work}" "${OUT_DIR:-${PROJECT_ROOT}/out}"
 WORK_DIR="$(cd "${WORK_DIR:-${PROJECT_ROOT}/work}" && pwd -P)"
@@ -44,19 +64,19 @@ for path in "${PROJECT_ROOT}" "${WORK_DIR}" "${OUT_DIR}"; do
   [[ "${path}" != *,* ]] || { echo 'Docker bind paths cannot contain commas' >&2; exit 1; }
   mounts+=(--mount "type=bind,source=${path},target=${path}")
 done
-environment=(-e "KERNEL_BUILD_MODE=${KERNEL_BUILD_MODE:-cross}" -e "BUILD_HOST_IMAGE_ID=${HOST_IMAGE_ID}")
+environment=(-e "KERNEL_BUILD_MODE=${KERNEL_BUILD_MODE:-cross}" -e "BUILD_HOST_IMAGE_ID=${HOST_IMAGE_IDENTITY}")
 # Root may read existing bind-mounted checkouts owned by the invoking user.
 # Trust only these exact repositories in the child process environment: never
 # change host/global Git configuration or trust every repository with '*'.
 safe_repositories=("${PROJECT_ROOT}" "${WORK_DIR}/vyos-build" "${WORK_DIR}/src/u-boot"
-                   "${WORK_DIR}/src/rkbin" "${WORK_DIR}/src/rtl8125" "${WORK_DIR}/src/aic8800")
+                   "${WORK_DIR}/src/rkbin" "${WORK_DIR}/src/arm-trusted-firmware" "${WORK_DIR}/src/aic8800")
 environment+=(-e "GIT_CONFIG_COUNT=${#safe_repositories[@]}")
 for i in "${!safe_repositories[@]}"; do
   environment+=(-e "GIT_CONFIG_KEY_${i}=safe.directory" -e "GIT_CONFIG_VALUE_${i}=${safe_repositories[i]}")
 done
 while IFS= read -r name; do
   case "${name}" in
-    VYOS_*|UBOOT_*|RKBIN_*|AIC8800_*|R8125_*|OLED_*|REBUILD_*|BUILDER_IMAGE|BUILDER_PULL|BUILDER_PULL_IMAGE|BUILD_BY|FLAVOR|REFRESH_SOURCES|SKIP_FETCH|DRY_RUN|IMAGE_SIZE_GIB|ESP_START_MIB|ESP_SIZE_MIB|ZSTD_LEVEL|KEEP_RAW_IMAGE|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)
+    VYOS_*|UBOOT_*|RKBIN_*|TFA_*|AIC8800_*|R8125_*|OLED_*|REBUILD_*|KERNEL_TREE_PRUNE|KERNEL_CCACHE|CCACHE_DIR|CCACHE_MAXSIZE|CCACHE_COMPILERCHECK|CCACHE_NOHASHDIR|BUILDER_IMAGE|BUILDER_PULL|BUILDER_PULL_IMAGE|BUILD_BY|FLAVOR|REFRESH_SOURCES|SKIP_FETCH|DRY_RUN|IMAGE_SIZE_GIB|ESP_START_MIB|ESP_SIZE_MIB|XZ_LEVEL|KEEP_RAW_IMAGE|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)
       environment+=(-e "${name}") ;;
   esac
 done < <(compgen -e)

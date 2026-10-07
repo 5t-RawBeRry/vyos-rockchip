@@ -1,0 +1,156 @@
+name: vyos-rolling
+
+# 跟踪 VyOS rolling，保证 main 始终能构建。
+# rolling 软件源只保留最新的按内核编译的模块包（依赖同版本 linux-image），上游一换内核，
+# 旧的 VYOS_BUILD_REF 就构建不出 ISO。本 workflow 每 6 小时：
+#   1. 读 vyos-build rolling HEAD 及其 kernel_version、rolling 软件源 arm64 的 linux-image 版本；
+#   2. 两者内核一致且 HEAD ≠ 钉的版本 → 改 build.conf，推到 bump/vyos-rolling；
+#      两者不一致说明上游正在换内核（vyos-build 已升、软件源未重建）→ 本轮不动；
+#   3. 在该分支跑 build-image 验证；通过 → 快进合入 main，再在 main 跑一次（暖 main 缓存、出产物）；
+#      失败 → 开（或追加到）issue，main 不动。
+# 实机验证另走发版流程：自动跟进只保证可构建。
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      board:
+        description: "验证构建用的设备"
+        type: choice
+        options: [e52c, a5e, e20c, m28k, r5s, all]
+        default: e52c
+
+concurrency:
+  group: vyos-rolling
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  BRANCH: bump/vyos-rolling
+  BOARD: ${{ inputs.board || 'e52c' }}
+
+jobs:
+  follow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Upstream vs pinned
+        id: up
+        run: .github/scripts/vyos-rolling detect
+
+      - name: Summary
+        env:
+          DECISION: ${{ steps.up.outputs.decision }}
+          URGENT: ${{ steps.up.outputs.urgent }}
+          HEAD_SHA: ${{ steps.up.outputs.head }}
+          CUR: ${{ steps.up.outputs.cur }}
+          KV_BUILD: ${{ steps.up.outputs.kv_build }}
+          KV_REPO: ${{ steps.up.outputs.kv_repo }}
+          CUR_KV: ${{ steps.up.outputs.cur_kv }}
+        run: |
+          case "$DECISION" in
+            current)    verdict="已是最新" ;;
+            bump)       verdict="有更新 → 跟进并验证" ;;
+            transition) verdict="上游正在换内核（vyos-build ${KV_BUILD} / 软件源 ${KV_REPO}），本轮不动" ;;
+          esac
+          {
+            echo "### VyOS rolling：${verdict}"
+            echo "| | vyos-build | kernel |"
+            echo "|---|---|---|"
+            echo "| 本仓库钉的 | \`${CUR:0:12}\` | ${CUR_KV} |"
+            echo "| rolling HEAD | \`${HEAD_SHA:0:12}\` | ${KV_BUILD} |"
+            echo "| rolling 软件源 | | ${KV_REPO} |"
+            [[ "$URGENT" != true ]] || echo "> 软件源内核已与钉的版本不同：当前钉的版本无法构建。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit bump to branch
+        if: steps.up.outputs.decision == 'bump'
+        env:
+          HEAD_SHA: ${{ steps.up.outputs.head }}
+          HEAD_DATE: ${{ steps.up.outputs.date }}
+          CUR: ${{ steps.up.outputs.cur }}
+          KV: ${{ steps.up.outputs.kv_build }}
+          CUR_KV: ${{ steps.up.outputs.cur_kv }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C "$BRANCH" origin/main
+          .github/scripts/vyos-rolling apply "$HEAD_SHA" "$HEAD_DATE" "$KV"
+          log=$(gh api "repos/vyos/vyos-build/compare/${CUR}...${HEAD_SHA}" \
+                  --jq '.commits[] | "- \(.sha[0:12]) \(.commit.message | split("\n")[0])"' | tail -40)
+          git commit -q -a -F - <<EOF
+          build: follow vyos-build rolling to ${HEAD_SHA:0:12} (kernel ${KV})
+
+          Automated by .github/workflows/vyos-rolling.yml.
+          Kernel ${CUR_KV} -> ${KV}; upstream https://github.com/vyos/vyos-build/compare/${CUR:0:12}...${HEAD_SHA:0:12}
+
+          ${log}
+          EOF
+          git push --force origin "$BRANCH"
+
+      - name: Validate on branch
+        id: validate
+        if: steps.up.outputs.decision == 'bump'
+        run: |
+          since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run build.yml --ref "$BRANCH" -f board="$BOARD" -f kernel_mode=cross -f iso_cache=daily
+          run=""
+          for _ in $(seq 30); do
+            sleep 10
+            run=$(gh run list --workflow build.yml --branch "$BRANCH" --event workflow_dispatch --limit 5 \
+                    --json databaseId,createdAt --jq "map(select(.createdAt >= \"$since\")) | last | .databaseId // empty")
+            [[ -z "$run" ]] || break
+          done
+          [[ -n "$run" ]] || { echo "::error::找不到 $BRANCH 上的 build-image 运行"; exit 1; }
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "验证构建：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"
+          gh run watch "$run" --exit-status --interval 60 > /dev/null
+
+      - name: Merge into main
+        if: steps.validate.outcome == 'success'
+        env:
+          RUN: ${{ steps.validate.outputs.run }}
+        run: |
+          git fetch -q origin main
+          git rebase -q origin/main
+          git push origin "HEAD:main"
+          git push -q origin --delete "$BRANCH"
+          gh workflow run build.yml --ref main -f board="$BOARD" -f kernel_mode=cross -f iso_cache=daily
+          for issue in $(gh issue list --state open --search 'VyOS rolling 跟进失败 in:title' --json number --jq '.[].number'); do
+            gh issue close "$issue" --comment "已由 $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN 验证通过并合入 main。"
+          done
+          echo "### 已合入 main 并触发 main 构建" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report failure
+        if: failure() && steps.up.outputs.decision == 'bump'
+        env:
+          HEAD_SHA: ${{ steps.up.outputs.head }}
+          KV: ${{ steps.up.outputs.kv_build }}
+          URGENT: ${{ steps.up.outputs.urgent }}
+          RUN: ${{ steps.validate.outputs.run }}
+        run: |
+          link="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/${RUN:-$GITHUB_RUN_ID}"
+          body="vyos-build rolling \`${HEAD_SHA:0:12}\`（kernel ${KV}）在 \`$BRANCH\` 上验证失败，main 未改动：${link}"
+          [[ "$URGENT" != true ]] || body="${body}"$'\n\n'"**rolling 软件源已换内核，main 当前钉的版本无法构建，需要尽快处理。**"
+          existing=$(gh issue list --state open --search 'VyOS rolling 跟进失败 in:title' --json number --jq '.[0].number // empty')
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "VyOS rolling 跟进失败：vyos-build ${HEAD_SHA:0:12}（kernel ${KV}）" --body "$body"
+          fi

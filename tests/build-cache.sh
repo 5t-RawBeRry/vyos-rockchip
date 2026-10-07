@@ -15,8 +15,12 @@ fixture() {
   LIB_DIR="${TMP}/lib"; OVERLAY_DIR="${TMP}/overlay"; BOARDS_DIR="${TMP}/boards"
   BOARD="test"; BOARD_UBOOT_DEFCONFIG=test_defconfig; BOARD_UNLOCK_CORES=0
   RKBIN_BL31=bl31; RKBIN_TPL=tpl; RKBIN_BL31_GLOB=bl31; RKBIN_TPL_GLOB=tpl
-  VYOS_VERSION="test-1"; BUILD_BY=builder; FLAVOR=rockchip; BUILDER_IMAGE="test"
+  # Boot-firmware family declaration (families/<name>.conf), as lib/env.sh sources it.
+  BOARD_FAMILY=rockchip; FAMILY_CONF="${ROOT}/families/rockchip.conf"; source "${FAMILY_CONF}"
+  VYOS_VERSION="test-1"; BUILD_BY=builder; FLAVOR=sbc; BUILDER_IMAGE="test"
   KERNEL_BUILD_MODE=container; JOBS=1; MOCK_BUILDER=sha256:one
+  # Optional build knobs may be exported by the caller (CI sets them); tests opt in explicitly.
+  KERNEL_TREE_PRUNE=0; KERNEL_CCACHE=0
   mkdir -p "${STATE_DIR}" "${LIB_DIR}" "${OVERLAY_DIR}" "${BOARDS_DIR}/test/overlay" "${ISO_KEEP_DIR}" "${UBOOT_OUT_DIR}"
   cp "${ROOT}/lib/"{sources,kernel,iso,uboot,overlay}.sh "${LIB_DIR}/"
   for module in sources kernel iso uboot overlay; do source "${LIB_DIR}/${module}.sh"; done
@@ -117,6 +121,44 @@ uboot_cache_reuse() {
   stage_uboot
   echo changed >> "${RKBIN_SRC}/tpl"
   if ( stage_uboot ); then return 1; fi
+  [[ ! -e "${UBOOT_OUT_DIR}/inputs.sha256" ]]
+}
+
+uboot_required_patches() {
+  local pdir="${BOARDS_DIR}/${BOARD}/uboot/patches" before
+  mkdir -p "${pdir}/always"
+  cat > "${pdir}/always/0001-fix.patch" <<'PATCH'
+diff --git a/README b/README
+--- a/README
++++ b/README
+@@ -1 +1 @@
+-initial
++required-fix
+PATCH
+  cat > "${pdir}/0002-unlock.patch" <<'PATCH'
+diff --git a/README b/README
+--- a/README
++++ b/README
+@@ -1 +1 @@
+-required-fix
++required-fix-and-unlock
+PATCH
+  make() { touch "${UBOOT_SRC}/u-boot-rockchip.bin"; }
+  install() { cp "${UBOOT_SRC}/u-boot-rockchip.bin" "${UBOOT_OUT_DIR}/u-boot-rockchip.bin"; }
+  stage_uboot
+  [[ "$(cat "${UBOOT_SRC}/README")" == required-fix ]]
+  [[ ! -e "${UBOOT_SRC}/patches" ]]
+  before="$(uboot_inputs_digest)"
+  printf '\n' >> "${pdir}/always/0001-fix.patch"
+  [[ "${before}" != "$(uboot_inputs_digest)" ]]
+  BOARD_UNLOCK_CORES=1
+  stage_uboot
+  [[ "$(cat "${UBOOT_SRC}/README")" == required-fix-and-unlock ]]
+  BOARD_UNLOCK_CORES=0
+  stage_uboot
+  [[ "$(cat "${UBOOT_SRC}/README")" == required-fix ]]
+  printf 'invalid patch\n' > "${pdir}/always/0001-fix.patch"
+  if stage_uboot; then return 1; fi
   [[ ! -e "${UBOOT_OUT_DIR}/inputs.sha256" ]]
 }
 
@@ -227,6 +269,41 @@ uboot_unstamped() {
   make() { return 1; }
   if ( stage_uboot ); then return 1; fi
 }
+# Allwinner (sun55i) family: BL31 comes from a TF-A build, artifact name and make
+# variables differ from rkbin, and the digest must follow the TF-A source commit.
+uboot_tfa_build() {
+  BOARD_FAMILY=sunxi; FAMILY_CONF="${ROOT}/families/sunxi.conf"; source "${FAMILY_CONF}"
+  family_soc_config sun55i; TFA_REF=fixture
+  TFA_SRC="${WORK_DIR}/src/arm-trusted-firmware"
+  git init -q "${TFA_SRC}"
+  git -C "${TFA_SRC}" config user.name fixture
+  git -C "${TFA_SRC}" config user.email fixture@example.invalid
+  echo initial > "${TFA_SRC}/README"; git -C "${TFA_SRC}" add README; git -C "${TFA_SRC}" commit -qm initial
+  rm -rf "${RKBIN_SRC}"   # must not be consulted on this family
+  MAKE_LOG="${TMP}/make.log"
+  make() {
+    printf '%s\n' "$*" >> "${MAKE_LOG}"
+    case " $* " in
+      *" bl31 "*)
+        [[ " $* " == *" PLAT=sun55i_a523 "* ]] || return 1
+        mkdir -p "${TFA_SRC}/build/sun55i_a523/debug"; echo bl31 > "${TFA_SRC}/build/sun55i_a523/debug/bl31.bin" ;;
+      *" BL31="*)
+        [[ " $* " == *" BL31=${TFA_SRC}/build/sun55i_a523/debug/bl31.bin "* && " $* " == *" SCP=/dev/null "* ]] || return 1
+        [[ " $* " != *" ROCKCHIP_TPL="* ]] || return 1
+        echo uboot > "${UBOOT_SRC}/u-boot-sunxi-with-spl.bin" ;;
+    esac
+  }
+  install() { cp "${UBOOT_SRC}/u-boot-sunxi-with-spl.bin" "${UBOOT_OUT_DIR}/u-boot-sunxi-with-spl.bin"; }
+  stage_uboot
+  [[ -f "${UBOOT_OUT_DIR}/u-boot-sunxi-with-spl.bin" && -f "${UBOOT_OUT_DIR}/inputs.sha256" ]]
+  grep -q ' bl31$' "${MAKE_LOG}"
+  # cached: no rebuild while inputs unchanged; a new TF-A commit invalidates the stamp
+  make() { return 1; }
+  stage_uboot
+  echo second >> "${TFA_SRC}/README"; git -C "${TFA_SRC}" commit -qam second
+  if ( stage_uboot ); then return 1; fi
+  [[ ! -e "${UBOOT_OUT_DIR}/inputs.sha256" ]]
+}
 
 overlay_deleted_files() {
   echo upstream > "${VYOS_BUILD_TREE}/tracked"
@@ -250,6 +327,72 @@ host_image_inputs() {
   BUILD_HOST_IMAGE_ID=sha256:changed
   [[ "${kernel}" != "$(kernel_inputs_digest)" && "${uboot}" != "$(uboot_inputs_digest)" ]]
 }
+kernel_ccache() {
+  kernel_cross_fixture
+  ccache() { :; }
+  make() {
+    printf '%s\n' "$@" > "${TMP}/make-args"
+    make_image_deb "${WORK_DIR}/kernel/linux-image-6.18.1-vyos_6.18.1-1_arm64.deb"
+  }
+  KERNEL_BUILD_MODE=cross
+  KERNEL_CCACHE=1
+  stage_kernel
+  grep -qx 'CC=ccache aarch64-linux-gnu-gcc' "${TMP}/make-args"
+  grep -qx 'HOSTCC=ccache gcc' "${TMP}/make-args"
+}
+kernel_prune_fixture() {
+  KSRC="${WORK_DIR}/kernel/linux-6.18.1"
+  mkdir -p "${KSRC}/scripts/package" "${KSRC}/certs" "${KSRC}/drivers"
+  echo object > "${KSRC}/drivers/big.o"
+  echo CONFIG_BPF=y > "${KSRC}/.config"
+  echo key > "${KSRC}/certs/signing_key.pem"
+  echo cert > "${KSRC}/certs/signing_key.x509"
+  echo elf > "${KSRC}/vmlinux"
+  # Stand-in for the kernel's own kit generator: checks the host-scripts contract.
+  cat > "${KSRC}/scripts/package/install-extmod-build" <<'KIT'
+#!/bin/sh
+set -eu
+[ "${CC}" = "${HOSTCC}" ] && [ "${srctree}" = . ] && [ "${SRCARCH}" = arm64 ]
+for f in Module.symvers include/config/kernel.release include/config/auto.conf \
+         scripts/sign-file scripts/mod/modpost scripts/basic/fixdep; do
+  mkdir -p "$1/$(dirname "${f}")"
+  echo kit > "$1/${f}"
+done
+[ "${EXTMOD_FAIL:-0}" = 0 ]
+KIT
+  aarch64-linux-gnu-objcopy() { cp "${@: -2:1}" "${@: -1}"; }
+  kernel_validate_btf() { [[ -s "$1" ]]; }
+}
+kernel_tree_prune() {
+  local f
+  kernel_prune_fixture
+  kernel_prune_tree "${KSRC}"
+  [[ ! -e "${KSRC}/drivers/big.o" && ! -e "${KSRC}.extmod" ]] || return 1
+  for f in Module.symvers .config certs/signing_key.pem certs/signing_key.x509 vmlinux scripts/sign-file; do
+    [[ -s "${KSRC}/${f}" ]] || return 1
+  done
+}
+kernel_tree_prune_keeps_tree_on_failure() {
+  kernel_prune_fixture
+  export EXTMOD_FAIL=1
+  if kernel_prune_tree "${KSRC}"; then return 1; fi
+  [[ -s "${KSRC}/drivers/big.o" && -s "${KSRC}/certs/signing_key.pem" ]]
+}
+uboot_exports_config_dtb() {
+  make() { touch "${UBOOT_SRC}/u-boot-rockchip.bin"; echo CONFIG_A=y > "${UBOOT_SRC}/.config"; echo dtb > "${UBOOT_SRC}/u-boot.dtb"; }
+  stage_uboot
+  [[ -s "${UBOOT_OUT_DIR}/u-boot.config" && -s "${UBOOT_OUT_DIR}/u-boot.dtb" ]]
+}
+# The CLI must print exactly the stage's own fingerprint, and reject unknown domains.
+digest_cli() {
+  local out
+  mkdir -p "${VYOS_BUILD_TREE}/docker"
+  echo 'FROM scratch' > "${VYOS_BUILD_TREE}/docker/Dockerfile"
+  out="$(WORK_DIR="${WORK_DIR}" "${BASH}" "${ROOT}/scripts/build.sh" --digest builder)"
+  source "${ROOT}/lib/builder.sh"
+  [[ "${out}" =~ ^[0-9a-f]{64}$ && "${out}" == "$(builder_context_digest)" ]] || return 1
+  if WORK_DIR="${WORK_DIR}" "${BASH}" "${ROOT}/scripts/build.sh" --digest bogus; then return 1; fi
+}
 kernel_package_validation() {
   local deb="${TMP}/image.deb"
   make_image_deb "${deb}"
@@ -265,7 +408,7 @@ PYTEST
 
 if (($#)); then fixture; "$1"; exit; fi
 failed=0
-for test in source_sha source_changed_ref source_same_head source_offline_mismatch source_outside_work source_work_root_alias source_symlink_escape cache_fail_closed uboot_cache_reuse kernel_recipe kernel_certificate kernel_builder kernel_mode kernel_stale_deb kernel_new_deb kernel_corrupt_new_deb kernel_container_new_deb kernel_container_corrupt_deb kernel_package_validation overlay_owner_flags overlay_deleted_files host_image_inputs iso_inputs uboot_inputs uboot_unstamped; do
+for test in source_sha source_changed_ref source_same_head source_offline_mismatch source_outside_work source_work_root_alias source_symlink_escape cache_fail_closed uboot_cache_reuse uboot_required_patches kernel_recipe kernel_certificate kernel_builder kernel_mode kernel_stale_deb kernel_new_deb kernel_corrupt_new_deb kernel_container_new_deb kernel_container_corrupt_deb kernel_package_validation overlay_owner_flags overlay_deleted_files host_image_inputs iso_inputs uboot_inputs uboot_unstamped uboot_tfa_build kernel_ccache kernel_tree_prune kernel_tree_prune_keeps_tree_on_failure uboot_exports_config_dtb digest_cli; do
   if "${BASH}" "$0" "${test}" > /dev/null 2>&1; then printf 'PASS %s\n' "${test}"; else printf 'FAIL %s\n' "${test}"; failed=$((failed+1)); fi
 done
 ((failed == 0))

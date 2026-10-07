@@ -1,5 +1,7 @@
-# VyOS for Rockchip（RK3528 / RK3568 / RK3582）— 入口快捷方式。真正的逻辑全在 scripts/build.sh。
-BOARDS := e20c m28k r5s e52c
+# VyOS for Rockchip（RK3528 / RK3568 / RK3582）+ Allwinner（A527 Cubie A5E）— 入口快捷方式。真正的逻辑全在 scripts/build.sh。
+BOARDS := e20c m28k r5s e52c a5e
+# 主用 E52C：裸 make 只构建 E52C，不会意外构建五板；all 仍需显式指定。
+.DEFAULT_GOAL := e52c
 
 .PHONY: all $(BOARDS) $(addsuffix -dry,$(BOARDS)) builder kernel iso clean distclean help
 
